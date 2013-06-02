@@ -34,7 +34,6 @@ import org.apache.commons.collections.IteratorUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.cache.FilterOfRowCache;
 import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.concurrent.RetryingScheduledThreadPoolExecutor;
@@ -121,7 +120,6 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
 
     /* SSTables on disk for this column family */
     private SSTableTracker ssTables;
-    private FilterOfRowCache rowCacheFilter;
 
     private LatencyTracker readStats = new LatencyTracker();
     private LatencyTracker writeStats = new LatencyTracker();
@@ -247,8 +245,6 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
             if (info.getIndexType() != null)
                 addIndex(info);
         }
-
-        rowCacheFilter = DatabaseDescriptor.getRowCacheFilterFor(this.table.name, columnFamily);
 
         // register the mbean
         String type = this.partitioner instanceof LocalPartitioner ? "IndexColumnFamilies" : "ColumnFamilies";
@@ -743,9 +739,8 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         boolean flushRequested = memtable.isThresholdViolated();
         memtable.put(key, columnFamily);
         ColumnFamily cachedRow = getRawCachedRow(key);
-        if (cachedRow != null && !rowCacheFilter.updateRowCache(key, cachedRow, columnFamily, gcBefore()))
-            invalidateCachedRow(key);
-
+        if (cachedRow != null)
+            cachedRow.addAll(columnFamily);
         writeStats.addNano(System.nanoTime() - start);
         
         return flushRequested ? memtable : null;
@@ -1092,7 +1087,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         ColumnFamily cached;
         if ((cached = ssTables.getRowCache().get(key)) == null)
         {
-            cached = getTopLevelColumns(rowCacheFilter.queryFilterProvider(key, columnFamily), Integer.MIN_VALUE);
+            cached = getTopLevelColumns(QueryFilter.getIdentityFilter(key, new QueryPath(columnFamily)), Integer.MIN_VALUE);
             if (cached == null)
                 return null;
             ssTables.getRowCache().put(key, cached);
@@ -1107,34 +1102,25 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         long start = System.nanoTime();
         try
         {
-            if (isCacheEnabled())
+            if (ssTables.getRowCache().getCapacity() == 0)
             {
-                ColumnFamily cached = tryCache(filter, gcBefore);
-                if (cached != null)
-                {
-                    return cached;
-                }
+                ColumnFamily cf = getTopLevelColumns(filter, gcBefore);
+                         
+                // TODO this is necessary because when we collate supercolumns together, we don't check
+                // their subcolumns for relevance, so we need to do a second prune post facto here.
+                return cf.isSuper() ? removeDeleted(cf, gcBefore) : removeDeletedCF(cf, gcBefore);
             }
 
-            ColumnFamily cf = getTopLevelColumns(filter, gcBefore);
-
-            // TODO this is necessary because when we collate supercolumns together, we don't check
-            // their subcolumns for relevance, so we need to do a second prune post facto here.
-            return cf.isSuper() ? removeDeleted(cf, gcBefore) : removeDeletedCF(cf, gcBefore);
+            ColumnFamily cached = cacheRow(filter.key);
+            if (cached == null)
+                return null;
+ 
+            return filterColumnFamily(cached, filter, gcBefore);
         }
         finally
         {
             readStats.addNano(System.nanoTime() - start);
         }
-    }
-
-    private ColumnFamily tryCache(QueryFilter filter, int gcBefore) {
-        ColumnFamily cached = cacheRow(filter.key);
-        return cached != null ? rowCacheFilter.columnFamilyFilter(cached, filter, gcBefore) : null;
-    }
-
-    private boolean isCacheEnabled() {
-        return ssTables.getRowCache().getCapacity() > 0;
     }
 
     /** filter a cached row, which will not be modified by the filter, but may be modified by throwing out

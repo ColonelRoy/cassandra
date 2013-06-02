@@ -30,8 +30,6 @@ import org.apache.commons.lang.builder.ToStringBuilder;
 
 import org.apache.avro.util.Utf8;
 import org.apache.cassandra.avro.ColumnDef;
-import org.apache.cassandra.cache.IdentityFilterOfRowCache;
-import org.apache.cassandra.cache.FilterOfRowCache;
 import org.apache.cassandra.db.ColumnFamilyType;
 import org.apache.cassandra.db.HintedHandOffManager;
 import org.apache.cassandra.db.SystemTable;
@@ -81,7 +79,6 @@ public final class CFMetaData
                               comparator,
                               subComparator,
                               comment,
-                              IdentityFilterOfRowCache.instance,
                               0,
                               0.01,
                               0,
@@ -144,8 +141,7 @@ public final class CFMetaData
     public final ColumnFamilyType cfType;             // standard, super
     public final AbstractType comparator;             // bytes, long, timeuuid, utf8, etc.
     public final AbstractType subcolumnComparator;    // like comparator, for supercolumns
-    public final FilterOfRowCache rowCacheFilter;       // default IdentityRowCacheFilter
-    
+
     //OPTIONAL
     private String comment;                           // default none, for humans only
     private double rowCacheSize;                      // default 0
@@ -170,7 +166,6 @@ public final class CFMetaData
                        AbstractType comparator,
                        AbstractType subcolumnComparator,
                        String comment,
-                       FilterOfRowCache rowCacheFilter,
                        double rowCacheSize,
                        double keyCacheSize,
                        double readRepairChance,
@@ -198,7 +193,6 @@ public final class CFMetaData
                                    ? BytesType.instance
                                    : subcolumnComparator;
         this.comment = comment == null ? "" : comment;
-        this.rowCacheFilter = rowCacheFilter;
         this.rowCacheSize = rowCacheSize;
         this.keyCacheSize = keyCacheSize;
         this.readRepairChance = readRepairChance;
@@ -237,7 +231,6 @@ public final class CFMetaData
                       AbstractType comparator,
                       AbstractType subcolumnComparator,
                       String comment,
-                      FilterOfRowCache rowCacheFilter,
                       double rowCacheSize,
                       double keyCacheSize,
                       double readRepairChance,
@@ -259,7 +252,6 @@ public final class CFMetaData
              comparator,
              subcolumnComparator,
              comment,
-             rowCacheFilter,
              rowCacheSize,
              keyCacheSize,
              readRepairChance,
@@ -284,7 +276,6 @@ public final class CFMetaData
                               columnComparator,
                               null,
                               "",
-                              IdentityFilterOfRowCache.instance,
                               0,
                               0,
                               0,
@@ -309,7 +300,6 @@ public final class CFMetaData
                               cfm.comparator,
                               cfm.subcolumnComparator,
                               cfm.comment,
-                              cfm.rowCacheFilter, 
                               cfm.rowCacheSize,
                               cfm.keyCacheSize,
                               cfm.readRepairChance,
@@ -335,7 +325,6 @@ public final class CFMetaData
                               cfm.comparator,
                               cfm.subcolumnComparator,
                               cfm.comment,
-                              cfm.rowCacheFilter, 
                               cfm.rowCacheSize,
                               cfm.keyCacheSize,
                               cfm.readRepairChance,
@@ -375,15 +364,6 @@ public final class CFMetaData
         if (subcolumnComparator != null)
             cf.subcomparator_type = new Utf8(subcolumnComparator.getClass().getName());
         cf.comment = new Utf8(comment);
-        cf.row_cache_filter = new Utf8(rowCacheFilter.getClass().getName());
-        if (rowCacheFilter.getParams() != null)
-        {
-            cf.row_cache_filter_params = new HashMap<CharSequence, CharSequence>();
-            for (Map.Entry<String, String> entry : rowCacheFilter.getParams().entrySet())
-            {
-                cf.row_cache_filter_params.put(entry.getKey(), entry.getValue());
-            }
-        }
         cf.row_cache_size = rowCacheSize;
         cf.key_cache_size = keyCacheSize;
         cf.read_repair_chance = readRepairChance;
@@ -427,25 +407,6 @@ public final class CFMetaData
             ColumnDefinition cd = ColumnDefinition.inflate(aColumn_metadata);
             column_metadata.put(cd.name, cd);
         }
-        
-        FilterOfRowCache rowCacheFilter;
-        try 
-        {
-            HashMap<String, String> params = null;
-            if (cf.row_cache_filter_params != null) 
-            {
-                params = new HashMap<String, String>();
-                for (Map.Entry<CharSequence, CharSequence> entry : cf.row_cache_filter_params.entrySet())
-                {
-                    params.put(entry.getKey().toString(), entry.getValue().toString());
-                }
-            }
-            rowCacheFilter = DatabaseDescriptor.getRowCacheFilter(cf.row_cache_filter != null ? cf.row_cache_filter.toString() : null, params);
-        }
-        catch (Exception ex)
-        {
-            throw new RuntimeException("Could not inflate CFMetaData for " + cf, ex);
-        }
 
         //isn't AVRO supposed to handle stuff like this?
         Integer minct = cf.min_compaction_threshold == null ? DEFAULT_MIN_COMPACTION_THRESHOLD : cf.min_compaction_threshold;
@@ -462,7 +423,6 @@ public final class CFMetaData
                               comparator,
                               subcolumnComparator,
                               cf.comment.toString(),
-                              rowCacheFilter, 
                               cf.row_cache_size,
                               cf.key_cache_size,
                               cf.read_repair_chance,

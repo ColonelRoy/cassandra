@@ -23,6 +23,8 @@ package org.apache.cassandra.config;
 
 import org.apache.cassandra.db.ColumnFamilyType;
 
+import java.util.Map;
+
 /**
  * @deprecated Yaml configuration for Keyspaces and ColumnFamilies is deprecated in 0.7
  */
@@ -33,7 +35,9 @@ public class RawColumnFamily
     public String compare_with;
     public String compare_subcolumns_with;
     public String comment;
-    public double rows_cached = CFMetaData.DEFAULT_ROW_CACHE_SIZE; 
+    public double rows_cached = CFMetaData.DEFAULT_ROW_CACHE_SIZE;
+    public String row_cache_filter;
+    public Map<String, ?> row_cache_filter_params;
     public double keys_cached = CFMetaData.DEFAULT_KEY_CACHE_SIZE; 
     public double read_repair_chance = CFMetaData.DEFAULT_READ_REPAIR_CHANCE;
     public int gc_grace_seconds = CFMetaData.DEFAULT_GC_GRACE_SECONDS;

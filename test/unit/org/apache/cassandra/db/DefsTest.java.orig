@@ -38,7 +38,6 @@ import org.apache.avro.Schema;
 import org.apache.avro.util.Utf8;
 import org.apache.cassandra.CleanupHelper;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.cache.IdentityRowCacheFilter;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.ConfigurationException;
@@ -113,7 +112,6 @@ public class DefsTest extends CleanupHelper
                 BytesType.instance,
                 null,
                 "No comment",
-                IdentityRowCacheFilter.instance, 
                 1.0,
                 1.0,
                 0.5,
@@ -765,7 +763,6 @@ public class DefsTest extends CleanupHelper
                               UTF8Type.instance,
                               null,
                               comment,
-                              IdentityRowCacheFilter.instance,
                               0,
                               1.0,
                               0,

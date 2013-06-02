@@ -21,7 +21,10 @@ package org.apache.cassandra.db;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.*;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.SortedSet;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -71,7 +74,6 @@ public class ColumnFamily implements IColumnContainer, IIterableColumns
     private transient ICompactSerializer2<IColumn> columnSerializer;
     final AtomicLong markedForDeleteAt = new AtomicLong(Long.MIN_VALUE);
     final AtomicInteger localDeletionTime = new AtomicInteger(Integer.MIN_VALUE);
-    final AtomicInteger columnEstimate = new AtomicInteger(0);
     private ConcurrentSkipListMap<ByteBuffer, IColumn> columns;
     
     public ColumnFamily(ColumnFamilyType type, AbstractType comparator, AbstractType subcolumnComparator, Integer cfid)
@@ -104,7 +106,6 @@ public class ColumnFamily implements IColumnContainer, IIterableColumns
     {
         ColumnFamily cf = cloneMeShallow();
         cf.columns = columns.clone();
-        cf.columnEstimate.set(cf.columns.size());
         return cf;
     }
 
@@ -205,8 +206,6 @@ public class ColumnFamily implements IColumnContainer, IIterableColumns
     public void clear()
     {
         columns.clear();
-        // this is not thread safe 
-        columnEstimate.set(0);
     }
 
     /*
@@ -237,10 +236,6 @@ public class ColumnFamily implements IColumnContainer, IIterableColumns
                 }
             }
         }
-        else 
-        {
-            columnEstimate.incrementAndGet();
-        }
     }
 
     public IColumn getColumn(ByteBuffer name)
@@ -263,17 +258,14 @@ public class ColumnFamily implements IColumnContainer, IIterableColumns
         return columns.descendingMap().values();
     }
 
-    public ConcurrentSkipListMap<ByteBuffer, IColumn> getColumnsMap()
+    public Map<ByteBuffer, IColumn> getColumnsMap()
     {
         return columns;
     }
 
     public void remove(ByteBuffer columnName)
     {
-        if (columns.remove(columnName) != null)
-        {
-            columnEstimate.decrementAndGet();
-        }
+        columns.remove(columnName);
     }
 
     @Deprecated // TODO this is a hack to set initial value outside constructor
@@ -404,7 +396,7 @@ public class ColumnFamily implements IColumnContainer, IIterableColumns
     {
         return localDeletionTime.get();
     }
-    
+
     public static AbstractType getComparatorFor(String table, String columnFamilyName, ByteBuffer superColumnName)
     {
         return superColumnName == null
@@ -437,8 +429,7 @@ public class ColumnFamily implements IColumnContainer, IIterableColumns
 
     public int getEstimatedColumnCount()
     {
-//        return getColumnCount();
-        return columnEstimate.get();
+        return getColumnCount();
     }
 
     public Iterator<IColumn> iterator()

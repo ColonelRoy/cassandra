@@ -411,8 +411,6 @@ keyspaces:
         - name: Standard1
           compare_with: BytesType
           keys_cached: 10000
-          row_cache_filter: TailRowCacheFilter
-          row_cache_filter_params: {limit: 100, reversed: false}          
           rows_cached: 1000
           row_cache_save_period_in_seconds: 0
           key_cache_save_period_in_seconds: 3600

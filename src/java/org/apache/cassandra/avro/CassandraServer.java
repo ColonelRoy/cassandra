@@ -38,6 +38,7 @@ import org.apache.avro.ipc.AvroRemoteException;
 import org.apache.avro.util.Utf8;
 import org.apache.cassandra.auth.AllowAllAuthenticator;
 import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.cache.FilterOfRowCache;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.*;
@@ -804,12 +805,25 @@ public class CassandraServer implements Cassandra {
         CFMetaData.validateMinMaxCompactionThresholds(cf_def);
         CFMetaData.validateMemtableSettings(cf_def);
 
+
+        HashMap<String, String> filterParams = new HashMap<String, String>();
+        if (cf_def.row_cache_filter_params != null)
+        {
+            for (Map.Entry<CharSequence, CharSequence> entry : cf_def.row_cache_filter_params.entrySet())
+            {
+                filterParams.put(entry.getKey().toString(), entry.getValue().toString());
+            }
+        }
+        FilterOfRowCache rowCacheFilter = DatabaseDescriptor.getRowCacheFilter(
+                cf_def.row_cache_filter != null ? cf_def.row_cache_filter.toString() : null, filterParams);
+
         return new CFMetaData(cf_def.keyspace.toString(),
                               cf_def.name.toString(),
                               ColumnFamilyType.create(cfType),
                               DatabaseDescriptor.getComparator(compare),
                               subCompare.length() == 0 ? null : DatabaseDescriptor.getComparator(subCompare),
                               cf_def.comment == null ? "" : cf_def.comment.toString(),
+                              rowCacheFilter,
                               cf_def.row_cache_size == null ? CFMetaData.DEFAULT_ROW_CACHE_SIZE : cf_def.row_cache_size,
                               cf_def.key_cache_size == null ? CFMetaData.DEFAULT_KEY_CACHE_SIZE : cf_def.key_cache_size,
                               cf_def.read_repair_chance == null ? CFMetaData.DEFAULT_READ_REPAIR_CHANCE : cf_def.read_repair_chance,

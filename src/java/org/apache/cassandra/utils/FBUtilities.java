@@ -42,6 +42,8 @@ import org.apache.commons.lang.ArrayUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.cache.IdentityFilterOfRowCache;
+import org.apache.cassandra.cache.FilterOfRowCache;
 import org.apache.cassandra.config.ConfigurationException;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.DecoratedKey;
@@ -675,5 +677,37 @@ public class FBUtilities
     private static Object toString(Object o)
     {
         return o.getClass().isArray() ? Arrays.toString((Object[]) o) : o.toString();
+    }
+
+    public static FilterOfRowCache getRowCacheFilter(String filter, Map<String, ?> filterParams) throws ConfigurationException
+    {
+        Class<? extends FilterOfRowCache> typeClass;
+        try
+        {
+            if (filter == null)
+            {
+                typeClass = IdentityFilterOfRowCache.class;
+            }
+            else
+            {
+                String className = filter.contains(".") ? filter : "org.apache.cassandra.cache." + filter;
+                typeClass = FBUtilities.<FilterOfRowCache>classForName(className, "row-filter");
+            }
+            Constructor<?>[] constructors = typeClass.getConstructors();
+            for (Constructor<?> constructor : constructors)
+            {
+                Class<?>[] parameterTypes = constructor.getParameterTypes();
+                if (parameterTypes.length == 1 && parameterTypes[0].isAssignableFrom(Map.class)) {
+                    return typeClass.getConstructor(Map.class).newInstance(filterParams);
+                }
+            }
+            return typeClass.getConstructor().newInstance();
+        }
+        catch (Exception e)
+        {
+            ConfigurationException ex = new ConfigurationException("Invalid RowCacheFilter: " + e.getMessage());
+            ex.initCause(e);
+            throw ex;
+        }
     }
 }

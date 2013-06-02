@@ -642,15 +642,15 @@ public class KsDef implements TBase<KsDef, KsDef._Fields>, java.io.Serializable,
         case 3: // STRATEGY_OPTIONS
           if (field.type == TType.MAP) {
             {
-              TMap _map29 = iprot.readMapBegin();
-              this.strategy_options = new HashMap<String,String>(2*_map29.size);
-              for (int _i30 = 0; _i30 < _map29.size; ++_i30)
+              TMap _map34 = iprot.readMapBegin();
+              this.strategy_options = new HashMap<String,String>(2*_map34.size);
+              for (int _i35 = 0; _i35 < _map34.size; ++_i35)
               {
-                String _key31;
-                String _val32;
-                _key31 = iprot.readString();
-                _val32 = iprot.readString();
-                this.strategy_options.put(_key31, _val32);
+                String _key36;
+                String _val37;
+                _key36 = iprot.readString();
+                _val37 = iprot.readString();
+                this.strategy_options.put(_key36, _val37);
               }
               iprot.readMapEnd();
             }
@@ -669,14 +669,14 @@ public class KsDef implements TBase<KsDef, KsDef._Fields>, java.io.Serializable,
         case 5: // CF_DEFS
           if (field.type == TType.LIST) {
             {
-              TList _list33 = iprot.readListBegin();
-              this.cf_defs = new ArrayList<CfDef>(_list33.size);
-              for (int _i34 = 0; _i34 < _list33.size; ++_i34)
+              TList _list38 = iprot.readListBegin();
+              this.cf_defs = new ArrayList<CfDef>(_list38.size);
+              for (int _i39 = 0; _i39 < _list38.size; ++_i39)
               {
-                CfDef _elem35;
-                _elem35 = new CfDef();
-                _elem35.read(iprot);
-                this.cf_defs.add(_elem35);
+                CfDef _elem40;
+                _elem40 = new CfDef();
+                _elem40.read(iprot);
+                this.cf_defs.add(_elem40);
               }
               iprot.readListEnd();
             }
@@ -717,10 +717,10 @@ public class KsDef implements TBase<KsDef, KsDef._Fields>, java.io.Serializable,
         oprot.writeFieldBegin(STRATEGY_OPTIONS_FIELD_DESC);
         {
           oprot.writeMapBegin(new TMap(TType.STRING, TType.STRING, this.strategy_options.size()));
-          for (Map.Entry<String, String> _iter36 : this.strategy_options.entrySet())
+          for (Map.Entry<String, String> _iter41 : this.strategy_options.entrySet())
           {
-            oprot.writeString(_iter36.getKey());
-            oprot.writeString(_iter36.getValue());
+            oprot.writeString(_iter41.getKey());
+            oprot.writeString(_iter41.getValue());
           }
           oprot.writeMapEnd();
         }
@@ -734,9 +734,9 @@ public class KsDef implements TBase<KsDef, KsDef._Fields>, java.io.Serializable,
       oprot.writeFieldBegin(CF_DEFS_FIELD_DESC);
       {
         oprot.writeListBegin(new TList(TType.STRUCT, this.cf_defs.size()));
-        for (CfDef _iter37 : this.cf_defs)
+        for (CfDef _iter42 : this.cf_defs)
         {
-          _iter37.write(oprot);
+          _iter42.write(oprot);
         }
         oprot.writeListEnd();
       }

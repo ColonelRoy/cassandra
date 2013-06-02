@@ -24,7 +24,6 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
-import java.nio.FloatBuffer;
 import java.util.*;
 
 import com.google.common.base.Charsets;
@@ -35,7 +34,6 @@ import org.apache.cassandra.auth.AllowAllAuthenticator;
 import org.apache.cassandra.auth.AllowAllAuthority;
 import org.apache.cassandra.auth.IAuthenticator;
 import org.apache.cassandra.auth.IAuthority;
-import org.apache.cassandra.cache.FilterOfRowCache;
 import org.apache.cassandra.config.Config.RequestSchedulerId;
 import org.apache.cassandra.db.ColumnFamilyType;
 import org.apache.cassandra.db.DefsTable;
@@ -130,7 +128,6 @@ public class    DatabaseDescriptor
             ksDesc.putListPropertyType("column_families", RawColumnFamily.class);
             TypeDescription cfDesc = new TypeDescription(RawColumnFamily.class);
             cfDesc.putListPropertyType("column_metadata", RawColumnDefinition.class);
-            cfDesc.putMapPropertyType("row_cache_filter_params", String.class, String.class);
             constructor.addTypeDescription(desc);
             constructor.addTypeDescription(ksDesc);
             constructor.addTypeDescription(cfDesc);
@@ -382,13 +379,13 @@ public class    DatabaseDescriptor
         }
         catch (ConfigurationException e)
         {
-            logger.error("Fatal error: " + e.getMessage(), e);
+            logger.error("Fatal error: " + e.getMessage());
             System.err.println("Bad configuration; unable to start server");
             System.exit(1);
         }
         catch (YAMLException e)
         {
-            logger.error("Fatal error: " + e.getMessage(), e);
+            logger.error("Fatal error: " + e.getMessage());
             System.err.println("Bad configuration; unable to start server");
             System.exit(1);
         }
@@ -605,15 +602,12 @@ public class    DatabaseDescriptor
                     metadata.put(columnName, new ColumnDefinition(columnName, rcd.validator_class, rcd.index_type, rcd.index_name));
                 }
 
-                FilterOfRowCache rowCacheFilter = FBUtilities.getRowCacheFilter(cf.row_cache_filter, cf.row_cache_filter_params);
-                
                 cfDefs[j++] = new CFMetaData(keyspace.name, 
                                              cf.name, 
                                              cfType,
                                              comparator, 
                                              subcolumnComparator, 
                                              cf.comment, 
-                                             rowCacheFilter, 
                                              cf.rows_cached,
                                              cf.keys_cached, 
                                              cf.read_repair_chance,
@@ -663,14 +657,6 @@ public class    DatabaseDescriptor
         return conf.thrift_framed_transport_size_in_mb * 1024 * 1024;
     }
 
-    public static FilterOfRowCache getRowCacheFilter(String filter, Map<String, String> params) throws ConfigurationException
-    {
-        if (filter == null) 
-            filter = "IdentityRowCacheFilter";
-        
-        return FBUtilities.getRowCacheFilter(filter, params);
-    }
-    
     public static AbstractType getComparator(CharSequence compareWith) throws ConfigurationException
     {
         if (compareWith == null)
@@ -978,12 +964,6 @@ public class    DatabaseDescriptor
         CFMetaData cfm = getCFMetaData(tableName, columnFamilyName);
         double v = (cfm == null) ? CFMetaData.DEFAULT_ROW_CACHE_SIZE : cfm.getRowCacheSize();
         return (int)Math.min(FBUtilities.absoluteFromFraction(v, expectedRows), Integer.MAX_VALUE);
-    }
-
-    public static FilterOfRowCache getRowCacheFilterFor(String tableName, String columnFamilyName)
-    {
-        assert tableName != null;
-        return getCFMetaData(tableName, columnFamilyName).rowCacheFilter;
     }
 
     public static KSMetaData getTableDefinition(String table)

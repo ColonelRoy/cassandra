@@ -1,0 +1,2492 @@
+Index: src/java/org/apache/cassandra/utils/FBUtilities.java
+===================================================================
+--- src/java/org/apache/cassandra/utils/FBUtilities.java	(revision 1060857)
++++ src/java/org/apache/cassandra/utils/FBUtilities.java	(revision )
+@@ -19,6 +19,7 @@
+ package org.apache.cassandra.utils;
+ 
+ import java.io.*;
++import java.lang.reflect.Constructor;
+ import java.lang.reflect.Field;
+ import java.lang.reflect.InvocationTargetException;
+ import java.math.BigInteger;
+@@ -37,8 +38,10 @@
+ 
+ import com.google.common.base.Charsets;
+ import com.google.common.base.Joiner;
++
++import org.apache.cassandra.cache.IdentityRowCacheFilter;
++import org.apache.cassandra.cache.RowCacheFilter;
+ import org.apache.commons.collections.iterators.CollatingIterator;
+-import org.apache.commons.lang.ArrayUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -490,7 +493,40 @@
+             throw ex;
+         }
+     }
+-
++    
++    
++    public static RowCacheFilter getRowCacheFilter(String filter, Map<String, ?> filterParams) throws ConfigurationException
++    {
++        Class<? extends RowCacheFilter> typeClass;
++        try
++        {
++            if (filter == null)
++            {
++                typeClass = IdentityRowCacheFilter.class;
++            }
++            else
++            {
++                String className = filter.contains(".") ? filter : "org.apache.cassandra.cache." + filter;
++                typeClass = FBUtilities.<RowCacheFilter>classForName(className, "row-filter");
++            }
++            Constructor<?>[] constructors = typeClass.getConstructors();
++            for (Constructor<?> constructor : constructors)
++            {
++                Class<?>[] parameterTypes = constructor.getParameterTypes();
++                if (parameterTypes.length == 1 && parameterTypes[0].isAssignableFrom(Map.class)) {
++                    return typeClass.getConstructor(Map.class).newInstance(filterParams);
++                }
++            }
++            return typeClass.getConstructor().newInstance();
++        }
++        catch (Exception e)
++        {
++            ConfigurationException ex = new ConfigurationException("Invalid RowCacheFilter: " + e.getMessage());
++            ex.initCause(e);
++            throw ex;
++        }
++    }
++
+     /**
+      * @return The Class for the given name.
+      * @param classname Fully qualified classname.
+Index: src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+===================================================================
+--- src/java/org/apache/cassandra/db/ColumnFamilyStore.java	(revision 1060921)
++++ src/java/org/apache/cassandra/db/ColumnFamilyStore.java	(revision )
+@@ -34,6 +34,7 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import org.apache.cassandra.cache.RowCacheFilter;
+ import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+ import org.apache.cassandra.concurrent.NamedThreadFactory;
+ import org.apache.cassandra.concurrent.RetryingScheduledThreadPoolExecutor;
+@@ -120,6 +121,7 @@
+ 
+     /* SSTables on disk for this column family */
+     private SSTableTracker ssTables;
++    private RowCacheFilter rowCacheFilter;
+ 
+     private LatencyTracker readStats = new LatencyTracker();
+     private LatencyTracker writeStats = new LatencyTracker();
+@@ -246,6 +248,8 @@
+                 addIndex(info);
+         }
+ 
++        rowCacheFilter = DatabaseDescriptor.getRowCacheFilterFor(this.table.name, columnFamily);
++
+         // register the mbean
+         String type = this.partitioner instanceof LocalPartitioner ? "IndexColumnFamilies" : "ColumnFamilies";
+         mbeanName = "org.apache.cassandra.db:type=" + type + ",keyspace=" + this.table.name + ",columnfamily=" + columnFamily;
+@@ -749,8 +753,9 @@
+         boolean flushRequested = memtable.isThresholdViolated();
+         memtable.put(key, columnFamily);
+         ColumnFamily cachedRow = getRawCachedRow(key);
+-        if (cachedRow != null)
+-            cachedRow.addAll(columnFamily);
++        if (cachedRow != null && !rowCacheFilter.applyUpdate(key, cachedRow, columnFamily, gcBefore()))
++            invalidateCachedRow(key);
++
+         writeStats.addNano(System.nanoTime() - start);
+         
+         return flushRequested ? memtable : null;
+@@ -1098,8 +1103,7 @@
+         ColumnFamily cached;
+         if ((cached = ssTables.getRowCache().get(key)) == null)
+         {
+-            cached = getTopLevelColumns(QueryFilter.getIdentityFilter(key, new QueryPath(columnFamily)), Integer.MIN_VALUE);
+-
++            cached = getTopLevelColumns(rowCacheFilter.createQueryFilter(key, columnFamily), Integer.MIN_VALUE);
+             if (cached == null)
+             {
+                 return null;
+@@ -1154,27 +1158,36 @@
+         long start = System.nanoTime();
+         try
+         {
+-            if (ssTables.getRowCache().getCapacity() == 0)
++            if (isCacheEnabled())
+             {
++                ColumnFamily cached = tryCache(filter, gcBefore);
++                if (cached != null)
++                {
++                    return cached;
++                }
++            }
++
+-                ColumnFamily cf = getTopLevelColumns(filter, gcBefore);
+-                         
+-                // TODO this is necessary because when we collate supercolumns together, we don't check
+-                // their subcolumns for relevance, so we need to do a second prune post facto here.
+-                return cf.isSuper() ? removeDeleted(cf, gcBefore) : removeDeletedCF(cf, gcBefore);
+-            }
++            ColumnFamily cf = getTopLevelColumns(filter, gcBefore);
++
++            // TODO this is necessary because when we collate supercolumns together, we don't check
++            // their subcolumns for relevance, so we need to do a second prune post facto here.
++            return cf.isSuper() ? removeDeleted(cf, gcBefore) : removeDeletedCF(cf, gcBefore);
++        }
+-
+-            ColumnFamily cached = cacheRow(filter.key);
+-            if (cached == null)
+-                return null;
+- 
+-            return filterColumnFamily(cached, filter, gcBefore);
+-        }
+         finally
+         {
+             readStats.addNano(System.nanoTime() - start);
+         }
+     }
+ 
++    private ColumnFamily tryCache(QueryFilter filter, int gcBefore) {
++        ColumnFamily cached = cacheRow(filter.key);
++        return cached != null ? rowCacheFilter.filterColumnFamily(cached, filter, gcBefore) : null;
++    }
++
++    private boolean isCacheEnabled() {
++        return ssTables.getRowCache().getCapacity() > 0;
++    }
++
+     /** filter a cached row, which will not be modified by the filter, but may be modified by throwing out
+      *  tombstones that are no longer relevant. */
+     ColumnFamily filterColumnFamily(ColumnFamily cached, QueryFilter filter, int gcBefore)
+Index: src/java/org/apache/cassandra/db/ColumnFamily.java
+===================================================================
+--- src/java/org/apache/cassandra/db/ColumnFamily.java	(revision 1059717)
++++ src/java/org/apache/cassandra/db/ColumnFamily.java	(revision )
+@@ -21,10 +21,7 @@
+ import java.nio.ByteBuffer;
+ import java.security.MessageDigest;
+ import java.security.NoSuchAlgorithmException;
+-import java.util.Collection;
+-import java.util.Iterator;
+-import java.util.Map;
+-import java.util.SortedSet;
++import java.util.*;
+ import java.util.concurrent.ConcurrentSkipListMap;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicLong;
+@@ -74,6 +71,7 @@
+     private transient ICompactSerializer2<IColumn> columnSerializer;
+     final AtomicLong markedForDeleteAt = new AtomicLong(Long.MIN_VALUE);
+     final AtomicInteger localDeletionTime = new AtomicInteger(Integer.MIN_VALUE);
++    final AtomicInteger columnEstimate = new AtomicInteger(0);
+     private ConcurrentSkipListMap<ByteBuffer, IColumn> columns;
+     
+     public ColumnFamily(ColumnFamilyType type, AbstractType comparator, AbstractType subcolumnComparator, Integer cfid)
+@@ -106,6 +104,7 @@
+     {
+         ColumnFamily cf = cloneMeShallow();
+         cf.columns = columns.clone();
++        cf.columnEstimate.set(cf.columns.size());
+         return cf;
+     }
+ 
+@@ -204,6 +203,8 @@
+     public void clear()
+     {
+         columns.clear();
++        // this is not thread safe 
++        columnEstimate.set(0);
+     }
+ 
+     /*
+@@ -234,7 +235,11 @@
+                 }
+             }
+         }
++        else 
++        {
++            columnEstimate.incrementAndGet();
+-    }
++        }
++    }
+ 
+     public IColumn getColumn(ByteBuffer name)
+     {
+@@ -256,15 +261,18 @@
+         return columns.descendingMap().values();
+     }
+ 
+-    public Map<ByteBuffer, IColumn> getColumnsMap()
++    public ConcurrentSkipListMap<ByteBuffer, IColumn> getColumnsMap()
+     {
+         return columns;
+     }
+ 
+     public void remove(ByteBuffer columnName)
+     {
+-        columns.remove(columnName);
++        if (columns.remove(columnName) != null)
++        {
++            columnEstimate.decrementAndGet();
+-    }
++        }
++    }
+ 
+     @Deprecated // TODO this is a hack to set initial value outside constructor
+     public void delete(int localtime, long timestamp)
+@@ -394,7 +402,7 @@
+     {
+         return localDeletionTime.get();
+     }
+-
++    
+     public static AbstractType getComparatorFor(String table, String columnFamilyName, ByteBuffer superColumnName)
+     {
+         return superColumnName == null
+@@ -419,7 +427,8 @@
+ 
+     public int getEstimatedColumnCount()
+     {
+-        return getColumnCount();
++//        return getColumnCount();
++        return columnEstimate.get();
+     }
+ 
+     public Iterator<IColumn> iterator()
+Index: src/java/org/apache/cassandra/cache/IdentityRowCacheFilter.java
+===================================================================
+--- src/java/org/apache/cassandra/cache/IdentityRowCacheFilter.java	(revision )
++++ src/java/org/apache/cassandra/cache/IdentityRowCacheFilter.java	(revision )
+@@ -0,0 +1,119 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.cache;
++
++import java.io.IOError;
++import java.io.IOException;
++import java.util.Map;
++
++import org.apache.cassandra.db.ColumnFamily;
++import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.DecoratedKey;
++import org.apache.cassandra.db.IColumn;
++import org.apache.cassandra.db.columniterator.IColumnIterator;
++import org.apache.cassandra.db.filter.QueryFilter;
++import org.apache.cassandra.db.filter.QueryPath;
++import org.apache.cassandra.db.filter.SliceQueryFilter;
++
++/**
++ * @author smeet
++ */
++public class IdentityRowCacheFilter implements RowCacheFilter
++{
++    public static IdentityRowCacheFilter instance = new IdentityRowCacheFilter();
++
++    @Override
++    public QueryFilter createQueryFilter(DecoratedKey key, String columnFamilyName)
++    {
++        return QueryFilter.getIdentityFilter(key, new QueryPath(columnFamilyName));
++    }
++
++    @Override
++    public boolean applyUpdate(DecoratedKey key, ColumnFamily cachedRow, ColumnFamily columnFamily, int gcBefore)
++    {
++        cachedRow.addAll(columnFamily);
++        return true;
++    }
++
++    @Override
++    public ColumnFamily filterColumnFamily(ColumnFamily cached, QueryFilter filter, int gcBefore)
++    {
++        // special case slicing the entire row:
++        // we can skip the filter step entirely, and we can help out removeDeleted by re-caching the result
++        // if any tombstones have aged out since last time.  (This means that the row cache will treat gcBefore as
++        // max(gcBefore, all previous gcBefore), which is fine for correctness.)
++        //
++        // But, if the filter is asking for less columns than we have cached, we fall back to the slow path
++        // since we have to copy out a subset.
++        if (filter.filter instanceof SliceQueryFilter)
++        {
++            SliceQueryFilter sliceFilter = (SliceQueryFilter) filter.filter;
++            if (sliceFilter.start.remaining() == 0 && sliceFilter.finish.remaining() == 0)
++            {
++                if (cached.isSuper() && filter.path.superColumnName != null)
++                {
++                    // subcolumns from named supercolumn
++                    IColumn sc = cached.getColumn(filter.path.superColumnName);
++                    if (sc == null || sliceFilter.count >= sc.getSubColumns().size())
++                    {
++                        ColumnFamily cf = cached.cloneMeShallow();
++                        if (sc != null)
++                            cf.addColumn(sc);
++                        return ColumnFamilyStore.removeDeleted(cf, gcBefore);
++                    }
++                }
++                else
++                {
++                    // top-level columns
++                    if (sliceFilter.count >= cached.getEstimatedColumnCount())
++                    {
++                        return ColumnFamilyStore.removeDeleted(cached, gcBefore);
++                    }
++                }
++            }
++        }
++
++        return collateAndRemoveDeleted(cached, filter, gcBefore);
++    }
++
++    @Override
++    public Map<String, String> getParams()
++    {
++        return null;
++    }
++
++    public static ColumnFamily collateAndRemoveDeleted(ColumnFamily cached, QueryFilter filter, int gcBefore)
++    {
++        IColumnIterator ci = filter.getMemtableColumnIterator(cached, null, cached.getComparator());
++        ColumnFamily cf;
++        try
++        {
++            cf = ci.getColumnFamily().cloneMeShallow();
++        }
++        catch (IOException e)
++        {
++            throw new IOError(e);
++        }
++        filter.collectCollatedColumns(cf, ci, gcBefore);
++        // TODO this is necessary because when we collate supercolumns together, we don't check
++        // their subcolumns for relevance, so we need to do a second prune post facto here.
++        return cf.isSuper() ? ColumnFamilyStore.removeDeleted(cf, gcBefore) : ColumnFamilyStore.removeDeletedCF(cf, gcBefore);
++    }
++}
++
+Index: test/unit/org/apache/cassandra/db/DefsTest.java
+===================================================================
+--- test/unit/org/apache/cassandra/db/DefsTest.java	(revision 1060077)
++++ test/unit/org/apache/cassandra/db/DefsTest.java	(revision )
+@@ -37,6 +37,7 @@
+ import org.apache.avro.util.Utf8;
+ import org.apache.cassandra.CleanupHelper;
+ import org.apache.cassandra.Util;
++import org.apache.cassandra.cache.IdentityRowCacheFilter;
+ import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.config.ColumnDefinition;
+ import org.apache.cassandra.config.ConfigurationException;
+@@ -109,6 +110,7 @@
+                 BytesType.instance,
+                 null,
+                 "No comment",
++                IdentityRowCacheFilter.instance, 
+                 1.0,
+                 1.0,
+                 0.5,
+@@ -760,6 +762,7 @@
+                               UTF8Type.instance,
+                               null,
+                               comment,
++                              IdentityRowCacheFilter.instance,
+                               0,
+                               1.0,
+                               0,
+Index: src/java/org/apache/cassandra/config/CFMetaData.java
+===================================================================
+--- src/java/org/apache/cassandra/config/CFMetaData.java	(revision 1060857)
++++ src/java/org/apache/cassandra/config/CFMetaData.java	(revision )
+@@ -30,6 +30,8 @@
+ 
+ import org.apache.avro.util.Utf8;
+ import org.apache.cassandra.avro.ColumnDef;
++import org.apache.cassandra.cache.IdentityRowCacheFilter;
++import org.apache.cassandra.cache.RowCacheFilter;
+ import org.apache.cassandra.db.ColumnFamilyType;
+ import org.apache.cassandra.db.HintedHandOffManager;
+ import org.apache.cassandra.db.SystemTable;
+@@ -78,6 +80,7 @@
+                               comparator,
+                               subComparator,
+                               comment,
++                              IdentityRowCacheFilter.instance,
+                               0,
+                               0.01,
+                               0,
+@@ -140,7 +143,8 @@
+     public final ColumnFamilyType cfType;             // standard, super
+     public final AbstractType comparator;             // bytes, long, timeuuid, utf8, etc.
+     public final AbstractType subcolumnComparator;    // like comparator, for supercolumns
++    public final RowCacheFilter rowCacheFilter;       // default IdentityRowCacheFilter
+-
++    
+     //OPTIONAL
+     private String comment;                           // default none, for humans only
+     private double rowCacheSize;                      // default 0
+@@ -165,6 +169,7 @@
+                        AbstractType comparator,
+                        AbstractType subcolumnComparator,
+                        String comment,
++                       RowCacheFilter rowCacheFilter,
+                        double rowCacheSize,
+                        double keyCacheSize,
+                        double readRepairChance,
+@@ -192,6 +197,7 @@
+                                    ? BytesType.instance
+                                    : subcolumnComparator;
+         this.comment = comment == null ? "" : comment;
++        this.rowCacheFilter = rowCacheFilter;
+         this.rowCacheSize = rowCacheSize;
+         this.keyCacheSize = keyCacheSize;
+         this.readRepairChance = readRepairChance;
+@@ -230,6 +236,7 @@
+                       AbstractType comparator,
+                       AbstractType subcolumnComparator,
+                       String comment,
++                      RowCacheFilter rowCacheFilter,
+                       double rowCacheSize,
+                       double keyCacheSize,
+                       double readRepairChance,
+@@ -251,6 +258,7 @@
+              comparator,
+              subcolumnComparator,
+              comment,
++             rowCacheFilter,
+              rowCacheSize,
+              keyCacheSize,
+              readRepairChance,
+@@ -275,6 +283,7 @@
+                               columnComparator,
+                               null,
+                               "",
++                              IdentityRowCacheFilter.instance,
+                               0,
+                               0,
+                               0,
+@@ -299,6 +308,7 @@
+                               cfm.comparator,
+                               cfm.subcolumnComparator,
+                               cfm.comment,
++                              cfm.rowCacheFilter, 
+                               cfm.rowCacheSize,
+                               cfm.keyCacheSize,
+                               cfm.readRepairChance,
+@@ -324,6 +334,7 @@
+                               cfm.comparator,
+                               cfm.subcolumnComparator,
+                               cfm.comment,
++                              cfm.rowCacheFilter, 
+                               cfm.rowCacheSize,
+                               cfm.keyCacheSize,
+                               cfm.readRepairChance,
+@@ -363,6 +374,15 @@
+         if (subcolumnComparator != null)
+             cf.subcomparator_type = new Utf8(subcolumnComparator.getClass().getName());
+         cf.comment = new Utf8(comment);
++        cf.row_cache_filter = new Utf8(rowCacheFilter.getClass().getName());
++        if (rowCacheFilter.getParams() != null)
++        {
++            cf.row_cache_filter_params = new HashMap<CharSequence, CharSequence>();
++            for (Map.Entry<String, String> entry : rowCacheFilter.getParams().entrySet())
++            {
++                cf.row_cache_filter_params.put(entry.getKey(), entry.getValue());
++            }
++        }
+         cf.row_cache_size = rowCacheSize;
+         cf.key_cache_size = keyCacheSize;
+         cf.read_repair_chance = readRepairChance;
+@@ -406,7 +426,26 @@
+             ColumnDefinition cd = ColumnDefinition.inflate(aColumn_metadata);
+             column_metadata.put(cd.name, cd);
+         }
+-
++        
++        RowCacheFilter rowCacheFilter;
++        try 
++        {
++            HashMap<String, String> params = null;
++            if (cf.row_cache_filter_params != null) 
++            {
++                params = new HashMap<String, String>();
++                for (Map.Entry<CharSequence, CharSequence> entry : cf.row_cache_filter_params.entrySet())
++                {
++                    params.put(entry.getKey().toString(), entry.getValue().toString());
++                }
++            }
++            rowCacheFilter = DatabaseDescriptor.getRowCacheFilter(cf.row_cache_filter != null ? cf.row_cache_filter.toString() : null, params);
++        }
++        catch (Exception ex)
++        {
++            throw new RuntimeException("Could not inflate CFMetaData for " + cf, ex);
++        }
++
+         //isn't AVRO supposed to handle stuff like this?
+         Integer minct = cf.min_compaction_threshold == null ? DEFAULT_MIN_COMPACTION_THRESHOLD : cf.min_compaction_threshold;
+         Integer maxct = cf.max_compaction_threshold == null ? DEFAULT_MAX_COMPACTION_THRESHOLD : cf.max_compaction_threshold;
+@@ -422,6 +461,7 @@
+                               comparator,
+                               subcolumnComparator,
+                               cf.comment.toString(),
++                              rowCacheFilter, 
+                               cf.row_cache_size,
+                               cf.key_cache_size,
+                               cf.read_repair_chance,
+Index: interface/thrift/gen-java/org/apache/cassandra/thrift/CfDef.java
+===================================================================
+--- interface/thrift/gen-java/org/apache/cassandra/thrift/CfDef.java	(revision 1026429)
++++ interface/thrift/gen-java/org/apache/cassandra/thrift/CfDef.java	(revision )
+@@ -58,19 +58,21 @@
+   private static final TField SUBCOMPARATOR_TYPE_FIELD_DESC = new TField("subcomparator_type", TType.STRING, (short)6);
+   private static final TField COMMENT_FIELD_DESC = new TField("comment", TType.STRING, (short)8);
+   private static final TField ROW_CACHE_SIZE_FIELD_DESC = new TField("row_cache_size", TType.DOUBLE, (short)9);
+-  private static final TField KEY_CACHE_SIZE_FIELD_DESC = new TField("key_cache_size", TType.DOUBLE, (short)11);
+-  private static final TField READ_REPAIR_CHANCE_FIELD_DESC = new TField("read_repair_chance", TType.DOUBLE, (short)12);
+-  private static final TField COLUMN_METADATA_FIELD_DESC = new TField("column_metadata", TType.LIST, (short)13);
+-  private static final TField GC_GRACE_SECONDS_FIELD_DESC = new TField("gc_grace_seconds", TType.I32, (short)14);
+-  private static final TField DEFAULT_VALIDATION_CLASS_FIELD_DESC = new TField("default_validation_class", TType.STRING, (short)15);
+-  private static final TField ID_FIELD_DESC = new TField("id", TType.I32, (short)16);
+-  private static final TField MIN_COMPACTION_THRESHOLD_FIELD_DESC = new TField("min_compaction_threshold", TType.I32, (short)17);
+-  private static final TField MAX_COMPACTION_THRESHOLD_FIELD_DESC = new TField("max_compaction_threshold", TType.I32, (short)18);
+-  private static final TField ROW_CACHE_SAVE_PERIOD_IN_SECONDS_FIELD_DESC = new TField("row_cache_save_period_in_seconds", TType.I32, (short)19);
+-  private static final TField KEY_CACHE_SAVE_PERIOD_IN_SECONDS_FIELD_DESC = new TField("key_cache_save_period_in_seconds", TType.I32, (short)20);
+-  private static final TField MEMTABLE_FLUSH_AFTER_MINS_FIELD_DESC = new TField("memtable_flush_after_mins", TType.I32, (short)21);
+-  private static final TField MEMTABLE_THROUGHPUT_IN_MB_FIELD_DESC = new TField("memtable_throughput_in_mb", TType.I32, (short)22);
+-  private static final TField MEMTABLE_OPERATIONS_IN_MILLIONS_FIELD_DESC = new TField("memtable_operations_in_millions", TType.DOUBLE, (short)23);
++  private static final TField ROW_CACHE_FILTER_FIELD_DESC = new TField("row_cache_filter", TType.STRING, (short)10);
++  private static final TField ROW_CACHE_FILTER_PARAMS_FIELD_DESC = new TField("row_cache_filter_params", TType.MAP, (short)11);
++  private static final TField KEY_CACHE_SIZE_FIELD_DESC = new TField("key_cache_size", TType.DOUBLE, (short)12);
++  private static final TField READ_REPAIR_CHANCE_FIELD_DESC = new TField("read_repair_chance", TType.DOUBLE, (short)13);
++  private static final TField COLUMN_METADATA_FIELD_DESC = new TField("column_metadata", TType.LIST, (short)14);
++  private static final TField GC_GRACE_SECONDS_FIELD_DESC = new TField("gc_grace_seconds", TType.I32, (short)15);
++  private static final TField DEFAULT_VALIDATION_CLASS_FIELD_DESC = new TField("default_validation_class", TType.STRING, (short)16);
++  private static final TField ID_FIELD_DESC = new TField("id", TType.I32, (short)17);
++  private static final TField MIN_COMPACTION_THRESHOLD_FIELD_DESC = new TField("min_compaction_threshold", TType.I32, (short)18);
++  private static final TField MAX_COMPACTION_THRESHOLD_FIELD_DESC = new TField("max_compaction_threshold", TType.I32, (short)19);
++  private static final TField ROW_CACHE_SAVE_PERIOD_IN_SECONDS_FIELD_DESC = new TField("row_cache_save_period_in_seconds", TType.I32, (short)20);
++  private static final TField KEY_CACHE_SAVE_PERIOD_IN_SECONDS_FIELD_DESC = new TField("key_cache_save_period_in_seconds", TType.I32, (short)21);
++  private static final TField MEMTABLE_FLUSH_AFTER_MINS_FIELD_DESC = new TField("memtable_flush_after_mins", TType.I32, (short)22);
++  private static final TField MEMTABLE_THROUGHPUT_IN_MB_FIELD_DESC = new TField("memtable_throughput_in_mb", TType.I32, (short)23);
++  private static final TField MEMTABLE_OPERATIONS_IN_MILLIONS_FIELD_DESC = new TField("memtable_operations_in_millions", TType.DOUBLE, (short)24);
+ 
+   public String keyspace;
+   public String name;
+@@ -79,6 +81,8 @@
+   public String subcomparator_type;
+   public String comment;
+   public double row_cache_size;
++  public String row_cache_filter;
++  public Map<String,String> row_cache_filter_params;
+   public double key_cache_size;
+   public double read_repair_chance;
+   public List<ColumnDef> column_metadata;
+@@ -102,19 +106,21 @@
+     SUBCOMPARATOR_TYPE((short)6, "subcomparator_type"),
+     COMMENT((short)8, "comment"),
+     ROW_CACHE_SIZE((short)9, "row_cache_size"),
+-    KEY_CACHE_SIZE((short)11, "key_cache_size"),
+-    READ_REPAIR_CHANCE((short)12, "read_repair_chance"),
+-    COLUMN_METADATA((short)13, "column_metadata"),
+-    GC_GRACE_SECONDS((short)14, "gc_grace_seconds"),
+-    DEFAULT_VALIDATION_CLASS((short)15, "default_validation_class"),
+-    ID((short)16, "id"),
+-    MIN_COMPACTION_THRESHOLD((short)17, "min_compaction_threshold"),
+-    MAX_COMPACTION_THRESHOLD((short)18, "max_compaction_threshold"),
+-    ROW_CACHE_SAVE_PERIOD_IN_SECONDS((short)19, "row_cache_save_period_in_seconds"),
+-    KEY_CACHE_SAVE_PERIOD_IN_SECONDS((short)20, "key_cache_save_period_in_seconds"),
+-    MEMTABLE_FLUSH_AFTER_MINS((short)21, "memtable_flush_after_mins"),
+-    MEMTABLE_THROUGHPUT_IN_MB((short)22, "memtable_throughput_in_mb"),
+-    MEMTABLE_OPERATIONS_IN_MILLIONS((short)23, "memtable_operations_in_millions");
++    ROW_CACHE_FILTER((short)10, "row_cache_filter"),
++    ROW_CACHE_FILTER_PARAMS((short)11, "row_cache_filter_params"),
++    KEY_CACHE_SIZE((short)12, "key_cache_size"),
++    READ_REPAIR_CHANCE((short)13, "read_repair_chance"),
++    COLUMN_METADATA((short)14, "column_metadata"),
++    GC_GRACE_SECONDS((short)15, "gc_grace_seconds"),
++    DEFAULT_VALIDATION_CLASS((short)16, "default_validation_class"),
++    ID((short)17, "id"),
++    MIN_COMPACTION_THRESHOLD((short)18, "min_compaction_threshold"),
++    MAX_COMPACTION_THRESHOLD((short)19, "max_compaction_threshold"),
++    ROW_CACHE_SAVE_PERIOD_IN_SECONDS((short)20, "row_cache_save_period_in_seconds"),
++    KEY_CACHE_SAVE_PERIOD_IN_SECONDS((short)21, "key_cache_save_period_in_seconds"),
++    MEMTABLE_FLUSH_AFTER_MINS((short)22, "memtable_flush_after_mins"),
++    MEMTABLE_THROUGHPUT_IN_MB((short)23, "memtable_throughput_in_mb"),
++    MEMTABLE_OPERATIONS_IN_MILLIONS((short)24, "memtable_operations_in_millions");
+ 
+     private static final Map<String, _Fields> byName = new HashMap<String, _Fields>();
+ 
+@@ -143,31 +149,35 @@
+           return COMMENT;
+         case 9: // ROW_CACHE_SIZE
+           return ROW_CACHE_SIZE;
+-        case 11: // KEY_CACHE_SIZE
++        case 10: // ROW_CACHE_FILTER
++          return ROW_CACHE_FILTER;
++        case 11: // ROW_CACHE_FILTER_PARAMS
++          return ROW_CACHE_FILTER_PARAMS;
++        case 12: // KEY_CACHE_SIZE
+           return KEY_CACHE_SIZE;
+-        case 12: // READ_REPAIR_CHANCE
++        case 13: // READ_REPAIR_CHANCE
+           return READ_REPAIR_CHANCE;
+-        case 13: // COLUMN_METADATA
++        case 14: // COLUMN_METADATA
+           return COLUMN_METADATA;
+-        case 14: // GC_GRACE_SECONDS
++        case 15: // GC_GRACE_SECONDS
+           return GC_GRACE_SECONDS;
+-        case 15: // DEFAULT_VALIDATION_CLASS
++        case 16: // DEFAULT_VALIDATION_CLASS
+           return DEFAULT_VALIDATION_CLASS;
+-        case 16: // ID
++        case 17: // ID
+           return ID;
+-        case 17: // MIN_COMPACTION_THRESHOLD
++        case 18: // MIN_COMPACTION_THRESHOLD
+           return MIN_COMPACTION_THRESHOLD;
+-        case 18: // MAX_COMPACTION_THRESHOLD
++        case 19: // MAX_COMPACTION_THRESHOLD
+           return MAX_COMPACTION_THRESHOLD;
+-        case 19: // ROW_CACHE_SAVE_PERIOD_IN_SECONDS
++        case 20: // ROW_CACHE_SAVE_PERIOD_IN_SECONDS
+           return ROW_CACHE_SAVE_PERIOD_IN_SECONDS;
+-        case 20: // KEY_CACHE_SAVE_PERIOD_IN_SECONDS
++        case 21: // KEY_CACHE_SAVE_PERIOD_IN_SECONDS
+           return KEY_CACHE_SAVE_PERIOD_IN_SECONDS;
+-        case 21: // MEMTABLE_FLUSH_AFTER_MINS
++        case 22: // MEMTABLE_FLUSH_AFTER_MINS
+           return MEMTABLE_FLUSH_AFTER_MINS;
+-        case 22: // MEMTABLE_THROUGHPUT_IN_MB
++        case 23: // MEMTABLE_THROUGHPUT_IN_MB
+           return MEMTABLE_THROUGHPUT_IN_MB;
+-        case 23: // MEMTABLE_OPERATIONS_IN_MILLIONS
++        case 24: // MEMTABLE_OPERATIONS_IN_MILLIONS
+           return MEMTABLE_OPERATIONS_IN_MILLIONS;
+         default:
+           return null;
+@@ -240,6 +250,12 @@
+         new FieldValueMetaData(TType.STRING)));
+     tmpMap.put(_Fields.ROW_CACHE_SIZE, new FieldMetaData("row_cache_size", TFieldRequirementType.OPTIONAL, 
+         new FieldValueMetaData(TType.DOUBLE)));
++    tmpMap.put(_Fields.ROW_CACHE_FILTER, new FieldMetaData("row_cache_filter", TFieldRequirementType.OPTIONAL, 
++        new FieldValueMetaData(TType.STRING)));
++    tmpMap.put(_Fields.ROW_CACHE_FILTER_PARAMS, new FieldMetaData("row_cache_filter_params", TFieldRequirementType.OPTIONAL, 
++        new MapMetaData(TType.MAP, 
++            new FieldValueMetaData(TType.STRING), 
++            new FieldValueMetaData(TType.STRING))));
+     tmpMap.put(_Fields.KEY_CACHE_SIZE, new FieldMetaData("key_cache_size", TFieldRequirementType.OPTIONAL, 
+         new FieldValueMetaData(TType.DOUBLE)));
+     tmpMap.put(_Fields.READ_REPAIR_CHANCE, new FieldMetaData("read_repair_chance", TFieldRequirementType.OPTIONAL, 
+@@ -278,6 +294,8 @@
+ 
+     this.row_cache_size = (double)0;
+ 
++    this.row_cache_filter = "IdentityRowCacheFilter";
++
+     this.key_cache_size = (double)200000;
+ 
+     this.read_repair_chance = 1;
+@@ -318,6 +336,24 @@
+       this.comment = other.comment;
+     }
+     this.row_cache_size = other.row_cache_size;
++    if (other.isSetRow_cache_filter()) {
++      this.row_cache_filter = other.row_cache_filter;
++    }
++    if (other.isSetRow_cache_filter_params()) {
++      Map<String,String> __this__row_cache_filter_params = new HashMap<String,String>();
++      for (Map.Entry<String, String> other_element : other.row_cache_filter_params.entrySet()) {
++
++        String other_element_key = other_element.getKey();
++        String other_element_value = other_element.getValue();
++
++        String __this__row_cache_filter_params_copy_key = other_element_key;
++
++        String __this__row_cache_filter_params_copy_value = other_element_value;
++
++        __this__row_cache_filter_params.put(__this__row_cache_filter_params_copy_key, __this__row_cache_filter_params_copy_value);
++      }
++      this.row_cache_filter_params = __this__row_cache_filter_params;
++    }
+     this.key_cache_size = other.key_cache_size;
+     this.read_repair_chance = other.read_repair_chance;
+     if (other.isSetColumn_metadata()) {
+@@ -357,6 +393,9 @@
+     this.comment = null;
+     this.row_cache_size = (double)0;
+ 
++    this.row_cache_filter = "IdentityRowCacheFilter";
++
++    this.row_cache_filter_params = null;
+     this.key_cache_size = (double)200000;
+ 
+     this.read_repair_chance = 1;
+@@ -550,6 +589,65 @@
+     __isset_bit_vector.set(__ROW_CACHE_SIZE_ISSET_ID, value);
+   }
+ 
++  public String getRow_cache_filter() {
++    return this.row_cache_filter;
++  }
++
++  public CfDef setRow_cache_filter(String row_cache_filter) {
++    this.row_cache_filter = row_cache_filter;
++    return this;
++  }
++
++  public void unsetRow_cache_filter() {
++    this.row_cache_filter = null;
++  }
++
++  /** Returns true if field row_cache_filter is set (has been asigned a value) and false otherwise */
++  public boolean isSetRow_cache_filter() {
++    return this.row_cache_filter != null;
++  }
++
++  public void setRow_cache_filterIsSet(boolean value) {
++    if (!value) {
++      this.row_cache_filter = null;
++    }
++  }
++
++  public int getRow_cache_filter_paramsSize() {
++    return (this.row_cache_filter_params == null) ? 0 : this.row_cache_filter_params.size();
++  }
++
++  public void putToRow_cache_filter_params(String key, String val) {
++    if (this.row_cache_filter_params == null) {
++      this.row_cache_filter_params = new HashMap<String,String>();
++    }
++    this.row_cache_filter_params.put(key, val);
++  }
++
++  public Map<String,String> getRow_cache_filter_params() {
++    return this.row_cache_filter_params;
++  }
++
++  public CfDef setRow_cache_filter_params(Map<String,String> row_cache_filter_params) {
++    this.row_cache_filter_params = row_cache_filter_params;
++    return this;
++  }
++
++  public void unsetRow_cache_filter_params() {
++    this.row_cache_filter_params = null;
++  }
++
++  /** Returns true if field row_cache_filter_params is set (has been asigned a value) and false otherwise */
++  public boolean isSetRow_cache_filter_params() {
++    return this.row_cache_filter_params != null;
++  }
++
++  public void setRow_cache_filter_paramsIsSet(boolean value) {
++    if (!value) {
++      this.row_cache_filter_params = null;
++    }
++  }
++
+   public double getKey_cache_size() {
+     return this.key_cache_size;
+   }
+@@ -924,6 +1022,22 @@
+       }
+       break;
+ 
++    case ROW_CACHE_FILTER:
++      if (value == null) {
++        unsetRow_cache_filter();
++      } else {
++        setRow_cache_filter((String)value);
++      }
++      break;
++
++    case ROW_CACHE_FILTER_PARAMS:
++      if (value == null) {
++        unsetRow_cache_filter_params();
++      } else {
++        setRow_cache_filter_params((Map<String,String>)value);
++      }
++      break;
++
+     case KEY_CACHE_SIZE:
+       if (value == null) {
+         unsetKey_cache_size();
+@@ -1054,6 +1168,12 @@
+     case ROW_CACHE_SIZE:
+       return new Double(getRow_cache_size());
+ 
++    case ROW_CACHE_FILTER:
++      return getRow_cache_filter();
++
++    case ROW_CACHE_FILTER_PARAMS:
++      return getRow_cache_filter_params();
++
+     case KEY_CACHE_SIZE:
+       return new Double(getKey_cache_size());
+ 
+@@ -1118,6 +1238,10 @@
+       return isSetComment();
+     case ROW_CACHE_SIZE:
+       return isSetRow_cache_size();
++    case ROW_CACHE_FILTER:
++      return isSetRow_cache_filter();
++    case ROW_CACHE_FILTER_PARAMS:
++      return isSetRow_cache_filter_params();
+     case KEY_CACHE_SIZE:
+       return isSetKey_cache_size();
+     case READ_REPAIR_CHANCE:
+@@ -1224,6 +1348,24 @@
+         return false;
+     }
+ 
++    boolean this_present_row_cache_filter = true && this.isSetRow_cache_filter();
++    boolean that_present_row_cache_filter = true && that.isSetRow_cache_filter();
++    if (this_present_row_cache_filter || that_present_row_cache_filter) {
++      if (!(this_present_row_cache_filter && that_present_row_cache_filter))
++        return false;
++      if (!this.row_cache_filter.equals(that.row_cache_filter))
++        return false;
++    }
++
++    boolean this_present_row_cache_filter_params = true && this.isSetRow_cache_filter_params();
++    boolean that_present_row_cache_filter_params = true && that.isSetRow_cache_filter_params();
++    if (this_present_row_cache_filter_params || that_present_row_cache_filter_params) {
++      if (!(this_present_row_cache_filter_params && that_present_row_cache_filter_params))
++        return false;
++      if (!this.row_cache_filter_params.equals(that.row_cache_filter_params))
++        return false;
++    }
++
+     boolean this_present_key_cache_size = true && this.isSetKey_cache_size();
+     boolean that_present_key_cache_size = true && that.isSetKey_cache_size();
+     if (this_present_key_cache_size || that_present_key_cache_size) {
+@@ -1383,6 +1525,16 @@
+     if (present_row_cache_size)
+       builder.append(row_cache_size);
+ 
++    boolean present_row_cache_filter = true && (isSetRow_cache_filter());
++    builder.append(present_row_cache_filter);
++    if (present_row_cache_filter)
++      builder.append(row_cache_filter);
++
++    boolean present_row_cache_filter_params = true && (isSetRow_cache_filter_params());
++    builder.append(present_row_cache_filter_params);
++    if (present_row_cache_filter_params)
++      builder.append(row_cache_filter_params);
++
+     boolean present_key_cache_size = true && (isSetKey_cache_size());
+     builder.append(present_key_cache_size);
+     if (present_key_cache_size)
+@@ -1529,6 +1681,26 @@
+         return lastComparison;
+       }
+     }
++    lastComparison = Boolean.valueOf(isSetRow_cache_filter()).compareTo(typedOther.isSetRow_cache_filter());
++    if (lastComparison != 0) {
++      return lastComparison;
++    }
++    if (isSetRow_cache_filter()) {
++      lastComparison = TBaseHelper.compareTo(this.row_cache_filter, typedOther.row_cache_filter);
++      if (lastComparison != 0) {
++        return lastComparison;
++      }
++    }
++    lastComparison = Boolean.valueOf(isSetRow_cache_filter_params()).compareTo(typedOther.isSetRow_cache_filter_params());
++    if (lastComparison != 0) {
++      return lastComparison;
++    }
++    if (isSetRow_cache_filter_params()) {
++      lastComparison = TBaseHelper.compareTo(this.row_cache_filter_params, typedOther.row_cache_filter_params);
++      if (lastComparison != 0) {
++        return lastComparison;
++      }
++    }
+     lastComparison = Boolean.valueOf(isSetKey_cache_size()).compareTo(typedOther.isSetKey_cache_size());
+     if (lastComparison != 0) {
+       return lastComparison;
+@@ -1726,7 +1898,33 @@
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 11: // KEY_CACHE_SIZE
++        case 10: // ROW_CACHE_FILTER
++          if (field.type == TType.STRING) {
++            this.row_cache_filter = iprot.readString();
++          } else { 
++            TProtocolUtil.skip(iprot, field.type);
++          }
++          break;
++        case 11: // ROW_CACHE_FILTER_PARAMS
++          if (field.type == TType.MAP) {
++            {
++              TMap _map25 = iprot.readMapBegin();
++              this.row_cache_filter_params = new HashMap<String,String>(2*_map25.size);
++              for (int _i26 = 0; _i26 < _map25.size; ++_i26)
++              {
++                String _key27;
++                String _val28;
++                _key27 = iprot.readString();
++                _val28 = iprot.readString();
++                this.row_cache_filter_params.put(_key27, _val28);
++              }
++              iprot.readMapEnd();
++            }
++          } else { 
++            TProtocolUtil.skip(iprot, field.type);
++          }
++          break;
++        case 12: // KEY_CACHE_SIZE
+           if (field.type == TType.DOUBLE) {
+             this.key_cache_size = iprot.readDouble();
+             setKey_cache_sizeIsSet(true);
+@@ -1734,7 +1932,7 @@
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 12: // READ_REPAIR_CHANCE
++        case 13: // READ_REPAIR_CHANCE
+           if (field.type == TType.DOUBLE) {
+             this.read_repair_chance = iprot.readDouble();
+             setRead_repair_chanceIsSet(true);
+@@ -1742,17 +1940,17 @@
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 13: // COLUMN_METADATA
++        case 14: // COLUMN_METADATA
+           if (field.type == TType.LIST) {
+             {
+-              TList _list25 = iprot.readListBegin();
+-              this.column_metadata = new ArrayList<ColumnDef>(_list25.size);
+-              for (int _i26 = 0; _i26 < _list25.size; ++_i26)
++              TList _list29 = iprot.readListBegin();
++              this.column_metadata = new ArrayList<ColumnDef>(_list29.size);
++              for (int _i30 = 0; _i30 < _list29.size; ++_i30)
+               {
+-                ColumnDef _elem27;
+-                _elem27 = new ColumnDef();
+-                _elem27.read(iprot);
+-                this.column_metadata.add(_elem27);
++                ColumnDef _elem31;
++                _elem31 = new ColumnDef();
++                _elem31.read(iprot);
++                this.column_metadata.add(_elem31);
+               }
+               iprot.readListEnd();
+             }
+@@ -1760,7 +1958,7 @@
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 14: // GC_GRACE_SECONDS
++        case 15: // GC_GRACE_SECONDS
+           if (field.type == TType.I32) {
+             this.gc_grace_seconds = iprot.readI32();
+             setGc_grace_secondsIsSet(true);
+@@ -1768,14 +1966,14 @@
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 15: // DEFAULT_VALIDATION_CLASS
++        case 16: // DEFAULT_VALIDATION_CLASS
+           if (field.type == TType.STRING) {
+             this.default_validation_class = iprot.readString();
+           } else { 
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 16: // ID
++        case 17: // ID
+           if (field.type == TType.I32) {
+             this.id = iprot.readI32();
+             setIdIsSet(true);
+@@ -1783,7 +1981,7 @@
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 17: // MIN_COMPACTION_THRESHOLD
++        case 18: // MIN_COMPACTION_THRESHOLD
+           if (field.type == TType.I32) {
+             this.min_compaction_threshold = iprot.readI32();
+             setMin_compaction_thresholdIsSet(true);
+@@ -1791,7 +1989,7 @@
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 18: // MAX_COMPACTION_THRESHOLD
++        case 19: // MAX_COMPACTION_THRESHOLD
+           if (field.type == TType.I32) {
+             this.max_compaction_threshold = iprot.readI32();
+             setMax_compaction_thresholdIsSet(true);
+@@ -1799,7 +1997,7 @@
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 19: // ROW_CACHE_SAVE_PERIOD_IN_SECONDS
++        case 20: // ROW_CACHE_SAVE_PERIOD_IN_SECONDS
+           if (field.type == TType.I32) {
+             this.row_cache_save_period_in_seconds = iprot.readI32();
+             setRow_cache_save_period_in_secondsIsSet(true);
+@@ -1807,7 +2005,7 @@
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 20: // KEY_CACHE_SAVE_PERIOD_IN_SECONDS
++        case 21: // KEY_CACHE_SAVE_PERIOD_IN_SECONDS
+           if (field.type == TType.I32) {
+             this.key_cache_save_period_in_seconds = iprot.readI32();
+             setKey_cache_save_period_in_secondsIsSet(true);
+@@ -1815,7 +2013,7 @@
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 21: // MEMTABLE_FLUSH_AFTER_MINS
++        case 22: // MEMTABLE_FLUSH_AFTER_MINS
+           if (field.type == TType.I32) {
+             this.memtable_flush_after_mins = iprot.readI32();
+             setMemtable_flush_after_minsIsSet(true);
+@@ -1823,7 +2021,7 @@
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 22: // MEMTABLE_THROUGHPUT_IN_MB
++        case 23: // MEMTABLE_THROUGHPUT_IN_MB
+           if (field.type == TType.I32) {
+             this.memtable_throughput_in_mb = iprot.readI32();
+             setMemtable_throughput_in_mbIsSet(true);
+@@ -1831,7 +2029,7 @@
+             TProtocolUtil.skip(iprot, field.type);
+           }
+           break;
+-        case 23: // MEMTABLE_OPERATIONS_IN_MILLIONS
++        case 24: // MEMTABLE_OPERATIONS_IN_MILLIONS
+           if (field.type == TType.DOUBLE) {
+             this.memtable_operations_in_millions = iprot.readDouble();
+             setMemtable_operations_in_millionsIsSet(true);
+@@ -1897,6 +2095,28 @@
+       oprot.writeDouble(this.row_cache_size);
+       oprot.writeFieldEnd();
+     }
++    if (this.row_cache_filter != null) {
++      if (isSetRow_cache_filter()) {
++        oprot.writeFieldBegin(ROW_CACHE_FILTER_FIELD_DESC);
++        oprot.writeString(this.row_cache_filter);
++        oprot.writeFieldEnd();
++      }
++    }
++    if (this.row_cache_filter_params != null) {
++      if (isSetRow_cache_filter_params()) {
++        oprot.writeFieldBegin(ROW_CACHE_FILTER_PARAMS_FIELD_DESC);
++        {
++          oprot.writeMapBegin(new TMap(TType.STRING, TType.STRING, this.row_cache_filter_params.size()));
++          for (Map.Entry<String, String> _iter32 : this.row_cache_filter_params.entrySet())
++          {
++            oprot.writeString(_iter32.getKey());
++            oprot.writeString(_iter32.getValue());
++          }
++          oprot.writeMapEnd();
++        }
++        oprot.writeFieldEnd();
++      }
++    }
+     if (isSetKey_cache_size()) {
+       oprot.writeFieldBegin(KEY_CACHE_SIZE_FIELD_DESC);
+       oprot.writeDouble(this.key_cache_size);
+@@ -1912,9 +2132,9 @@
+         oprot.writeFieldBegin(COLUMN_METADATA_FIELD_DESC);
+         {
+           oprot.writeListBegin(new TList(TType.STRUCT, this.column_metadata.size()));
+-          for (ColumnDef _iter28 : this.column_metadata)
++          for (ColumnDef _iter33 : this.column_metadata)
+           {
+-            _iter28.write(oprot);
++            _iter33.write(oprot);
+           }
+           oprot.writeListEnd();
+         }
+@@ -2043,6 +2263,26 @@
+       sb.append(this.row_cache_size);
+       first = false;
+     }
++    if (isSetRow_cache_filter()) {
++      if (!first) sb.append(", ");
++      sb.append("row_cache_filter:");
++      if (this.row_cache_filter == null) {
++        sb.append("null");
++      } else {
++        sb.append(this.row_cache_filter);
++      }
++      first = false;
++    }
++    if (isSetRow_cache_filter_params()) {
++      if (!first) sb.append(", ");
++      sb.append("row_cache_filter_params:");
++      if (this.row_cache_filter_params == null) {
++        sb.append("null");
++      } else {
++        sb.append(this.row_cache_filter_params);
++      }
++      first = false;
++    }
+     if (isSetKey_cache_size()) {
+       if (!first) sb.append(", ");
+       sb.append("key_cache_size:");
+Index: src/java/org/apache/cassandra/cache/TailRowCacheFilter.java
+===================================================================
+--- src/java/org/apache/cassandra/cache/TailRowCacheFilter.java	(revision )
++++ src/java/org/apache/cassandra/cache/TailRowCacheFilter.java	(revision )
+@@ -0,0 +1,204 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.cache;
++
++import java.nio.ByteBuffer;
++import java.util.Map;
++import java.util.SortedSet;
++import java.util.concurrent.ConcurrentSkipListMap;
++
++import org.apache.cassandra.db.ColumnFamily;
++import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.DecoratedKey;
++import org.apache.cassandra.db.IColumn;
++import org.apache.cassandra.db.filter.NamesQueryFilter;
++import org.apache.cassandra.db.filter.QueryFilter;
++import org.apache.cassandra.db.filter.QueryPath;
++import org.apache.cassandra.db.filter.SliceQueryFilter;
++import org.apache.cassandra.db.marshal.AbstractType;
++import org.apache.cassandra.utils.ByteBufferUtil;
++
++public class TailRowCacheFilter implements RowCacheFilter
++{
++    public static final String ROW_CACHE_LIMIT = "limit";
++    public static final String ROW_CACHE_REVERSED = "reversed";
++    
++    private final int limit;
++    private final boolean reversed; // default false
++    private final Map<String, String> filterParams;
++
++    public TailRowCacheFilter(Map<String, String> filterParams)
++    {
++        this.filterParams = filterParams;
++        String rowCacheLimit = filterParams.get(ROW_CACHE_LIMIT);
++        if (rowCacheLimit == null)
++        {
++            throw new IllegalArgumentException("row cache limit not set");
++        }
++        limit = Integer.parseInt(rowCacheLimit);
++        String cacheReversed = filterParams.get(ROW_CACHE_REVERSED);
++        reversed = (cacheReversed != null) && Boolean.parseBoolean(cacheReversed);
++    }
++
++    public QueryFilter createQueryFilter(DecoratedKey key, String columnFamilyName)
++    {
++        return new QueryFilter(key, new QueryPath(columnFamilyName), 
++                               new SliceQueryFilter(ByteBufferUtil.EMPTY_BYTE_BUFFER, ByteBufferUtil.EMPTY_BYTE_BUFFER, 
++                                                    reversed, limit));
++    }
++
++    public boolean applyUpdate(DecoratedKey key, ColumnFamily cachedRow, ColumnFamily columnsToAdd, int gcBefore)
++    {
++        AbstractType comparator = cachedRow.getComparator();
++        ConcurrentSkipListMap<ByteBuffer, IColumn> cachedColumns = cachedRow.getColumnsMap();
++
++        // TODO: the size count might hurt for larger rows like caching 10k friend ids
++        if (reversed)
++        {
++            for (IColumn column : columnsToAdd.getColumnsMap().descendingMap().values())
++            {
++                if (cachedRow.getEstimatedColumnCount() < limit ||
++                    comparator.compare(column.name(), cachedColumns.firstKey()) > 0)
++                {
++                    if (column.isMarkedForDelete())
++                        return false;
++                    
++                    cachedRow.addColumn(column);
++                }
++            }
++        }
++        else
++        {
++            for (IColumn column : columnsToAdd.getColumnsMap().values())
++            {
++                if (cachedRow.getEstimatedColumnCount() < limit ||
++                    comparator.compare(cachedColumns.lastKey(), column.name()) > 0)
++                {
++                    if (column.isMarkedForDelete())
++                        return false;
++
++                    cachedRow.addColumn(column);
++                }
++            }
++        }
++        
++        cachedRow.delete(columnsToAdd);
++        
++        if (cachedRow.getEstimatedColumnCount() > limit) 
++        {
++            ColumnFamilyStore.removeDeleted(cachedRow, gcBefore);
++            
++            while (true)
++            {
++                ByteBuffer name = reversed ? cachedColumns.firstKey() : cachedColumns.lastKey();                
++                if (cachedRow.getEstimatedColumnCount() <= limit)
++                    break;
++                
++                cachedRow.remove(name);
++            }
++        }
++        
++        return true;
++    }
++
++    @Override
++    public ColumnFamily filterColumnFamily(ColumnFamily cachedRow, QueryFilter filter, int gcBefore) 
++    {
++        ConcurrentSkipListMap<ByteBuffer, IColumn> cachedMap = cachedRow.getColumnsMap();
++        AbstractType comparator = cachedRow.getComparator();
++        
++        if (filter.filter instanceof SliceQueryFilter) {
++            SliceQueryFilter sliceQueryFilter = (SliceQueryFilter) filter.filter;
++            if (sliceQueryFilter.reversed != reversed)
++                return null;
++            
++            // if the finish bound of the filter is not in the cache and the query limit is greater than the cache size we're out of luck
++            if (sliceQueryFilter.count > limit && (!sliceQueryFilter.finish.hasRemaining() || 
++                    (reversed && comparator.compare(sliceQueryFilter.finish, cachedMap.firstKey()) < 0)) ||
++                    (!reversed && comparator.compare(sliceQueryFilter.finish, cachedMap.lastKey()) > 0))
++                return null;
++            
++            if (!sliceQueryFilter.start.hasRemaining())
++                return IdentityRowCacheFilter.collateAndRemoveDeleted(cachedRow, filter, gcBefore);
++
++                        
++            if (reversed && comparator.compare(sliceQueryFilter.start, cachedMap.firstKey()) > 0)
++            {
++                ColumnFamily returnCF = IdentityRowCacheFilter.collateAndRemoveDeleted(cachedRow, filter, gcBefore);
++                if (sliceQueryFilter.finish.hasRemaining() && comparator.compare(sliceQueryFilter.finish, cachedMap.firstKey()) >= 0)
++                {
++                    return returnCF;
++                }
++                else
++                {
++                    return getLiveColumnCount(returnCF) >= ((SliceQueryFilter) filter.filter).count ? returnCF : null;
++                }
++            }
++
++            if (!reversed && comparator.compare(sliceQueryFilter.start, cachedMap.lastKey()) < 0)
++            {
++                ColumnFamily returnCF = IdentityRowCacheFilter.collateAndRemoveDeleted(cachedRow, filter, gcBefore);
++                if (sliceQueryFilter.finish.hasRemaining() && comparator.compare(sliceQueryFilter.finish, cachedMap.lastKey()) <= 0)
++                {
++                    return returnCF;
++                }
++                else 
++                {
++                    return getLiveColumnCount(returnCF) >= ((SliceQueryFilter) filter.filter).count ? returnCF : null;
++                }
++            }
++                
++            return null;
++            
++            
++        } else if (filter.filter instanceof NamesQueryFilter) {
++            NamesQueryFilter namesQueryFilter = (NamesQueryFilter) filter.filter;
++            SortedSet<ByteBuffer> columns = namesQueryFilter.columns;
++
++            ByteBuffer firstKey = cachedMap.firstKey();
++            ByteBuffer lastKey = cachedMap.lastKey();
++            for (ByteBuffer column : columns) {
++                if (reversed && comparator.compare(column, firstKey) < 0 ||
++                    !reversed && comparator.compare(column, lastKey) > 0)
++                    return null;
++            }
++            ColumnFamily returnCF = IdentityRowCacheFilter.collateAndRemoveDeleted(cachedRow, filter, gcBefore);
++            // if the cached map bounds have been changed theres a chance that we missed a column
++            return (comparator.compare(firstKey, cachedMap.firstKey()) == 0 && comparator.compare(lastKey, cachedMap.lastKey()) == 0) ? returnCF : null;
++        }
++        
++        return null;
++    }
++
++    @Override
++    public Map<String, String> getParams()
++    {
++        return filterParams;
++    }
++
++    private int getLiveColumnCount(ColumnFamily returnCF)
++    {
++        int count = 0;
++        for (IColumn column : returnCF.getSortedColumns())
++        {
++            if (column.isLive()) count++;
++        }
++        return count;
++    }
++}
+Index: src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+===================================================================
+--- src/java/org/apache/cassandra/config/DatabaseDescriptor.java	(revision 1061897)
++++ src/java/org/apache/cassandra/config/DatabaseDescriptor.java	(revision )
+@@ -24,6 +24,7 @@
+ import java.net.URL;
+ import java.net.UnknownHostException;
+ import java.nio.ByteBuffer;
++import java.nio.FloatBuffer;
+ import java.util.*;
+ 
+ import com.google.common.base.Charsets;
+@@ -34,6 +35,7 @@
+ import org.apache.cassandra.auth.AllowAllAuthority;
+ import org.apache.cassandra.auth.IAuthenticator;
+ import org.apache.cassandra.auth.IAuthority;
++import org.apache.cassandra.cache.RowCacheFilter;
+ import org.apache.cassandra.config.Config.RequestSchedulerId;
+ import org.apache.cassandra.db.ColumnFamilyType;
+ import org.apache.cassandra.db.DefsTable;
+@@ -129,6 +131,7 @@
+             ksDesc.putListPropertyType("column_families", RawColumnFamily.class);
+             TypeDescription cfDesc = new TypeDescription(RawColumnFamily.class);
+             cfDesc.putListPropertyType("column_metadata", RawColumnDefinition.class);
++            cfDesc.putMapPropertyType("row_cache_filter_params", String.class, String.class);
+             constructor.addTypeDescription(desc);
+             constructor.addTypeDescription(ksDesc);
+             constructor.addTypeDescription(cfDesc);
+@@ -380,13 +383,13 @@
+         }
+         catch (ConfigurationException e)
+         {
+-            logger.error("Fatal error: " + e.getMessage());
++            logger.error("Fatal error: " + e.getMessage(), e);
+             System.err.println("Bad configuration; unable to start server");
+             System.exit(1);
+         }
+         catch (YAMLException e)
+         {
+-            logger.error("Fatal error: " + e.getMessage());
++            logger.error("Fatal error: " + e.getMessage(), e);
+             System.err.println("Bad configuration; unable to start server");
+             System.exit(1);
+         }
+@@ -603,12 +606,15 @@
+                     metadata.put(columnName, new ColumnDefinition(columnName, rcd.validator_class, rcd.index_type, rcd.index_name));
+                 }
+ 
++                RowCacheFilter rowCacheFilter = FBUtilities.getRowCacheFilter(cf.row_cache_filter, cf.row_cache_filter_params);
++                
+                 cfDefs[j++] = new CFMetaData(keyspace.name, 
+                                              cf.name, 
+                                              cfType,
+                                              comparator, 
+                                              subcolumnComparator, 
+                                              cf.comment, 
++                                             rowCacheFilter, 
+                                              cf.rows_cached,
+                                              cf.keys_cached, 
+                                              cf.read_repair_chance,
+@@ -658,6 +664,14 @@
+         return conf.thrift_framed_transport_size_in_mb * 1024 * 1024;
+     }
+ 
++    public static RowCacheFilter getRowCacheFilter(String filter, Map<String, String> params) throws ConfigurationException
++    {
++        if (filter == null) 
++            filter = "IdentityRowCacheFilter";
++        
++        return FBUtilities.getRowCacheFilter(filter, params);
++    }
++    
+     public static AbstractType getComparator(CharSequence compareWith) throws ConfigurationException
+     {
+         if (compareWith == null)
+@@ -971,6 +985,12 @@
+         return (int)Math.min(FBUtilities.absoluteFromFraction(v, expectedRows), Integer.MAX_VALUE);
+     }
+ 
++    public static RowCacheFilter getRowCacheFilterFor(String tableName, String columnFamilyName)
++    {
++        assert tableName != null;
++        return getCFMetaData(tableName, columnFamilyName).rowCacheFilter;
++    }
++
+     public static KSMetaData getTableDefinition(String table)
+     {
+         return tables.get(table);
+Index: src/java/org/apache/cassandra/cache/RowCacheFilter.java
+===================================================================
+--- src/java/org/apache/cassandra/cache/RowCacheFilter.java	(revision )
++++ src/java/org/apache/cassandra/cache/RowCacheFilter.java	(revision )
+@@ -0,0 +1,36 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.cache;
++
++import java.util.Map;
++
++import org.apache.cassandra.db.ColumnFamily;
++import org.apache.cassandra.db.DecoratedKey;
++import org.apache.cassandra.db.filter.QueryFilter;
++
++public interface RowCacheFilter
++{
++    public QueryFilter createQueryFilter(DecoratedKey key, String columnFamilyName);
++
++    public boolean applyUpdate(DecoratedKey key, ColumnFamily cachedRow, ColumnFamily columnFamily, int gcBefore);
++
++    public ColumnFamily filterColumnFamily(ColumnFamily cachedRow, QueryFilter filter, int gcBefore);
++    
++    public Map<String, String> getParams();
++}
+Index: interface/thrift/gen-java/org/apache/cassandra/thrift/KsDef.java
+===================================================================
+--- interface/thrift/gen-java/org/apache/cassandra/thrift/KsDef.java	(revision 1026200)
++++ interface/thrift/gen-java/org/apache/cassandra/thrift/KsDef.java	(revision )
+@@ -642,15 +642,15 @@
+         case 3: // STRATEGY_OPTIONS
+           if (field.type == TType.MAP) {
+             {
+-              TMap _map29 = iprot.readMapBegin();
+-              this.strategy_options = new HashMap<String,String>(2*_map29.size);
+-              for (int _i30 = 0; _i30 < _map29.size; ++_i30)
++              TMap _map34 = iprot.readMapBegin();
++              this.strategy_options = new HashMap<String,String>(2*_map34.size);
++              for (int _i35 = 0; _i35 < _map34.size; ++_i35)
+               {
+-                String _key31;
+-                String _val32;
+-                _key31 = iprot.readString();
+-                _val32 = iprot.readString();
+-                this.strategy_options.put(_key31, _val32);
++                String _key36;
++                String _val37;
++                _key36 = iprot.readString();
++                _val37 = iprot.readString();
++                this.strategy_options.put(_key36, _val37);
+               }
+               iprot.readMapEnd();
+             }
+@@ -669,14 +669,14 @@
+         case 5: // CF_DEFS
+           if (field.type == TType.LIST) {
+             {
+-              TList _list33 = iprot.readListBegin();
+-              this.cf_defs = new ArrayList<CfDef>(_list33.size);
+-              for (int _i34 = 0; _i34 < _list33.size; ++_i34)
++              TList _list38 = iprot.readListBegin();
++              this.cf_defs = new ArrayList<CfDef>(_list38.size);
++              for (int _i39 = 0; _i39 < _list38.size; ++_i39)
+               {
+-                CfDef _elem35;
+-                _elem35 = new CfDef();
+-                _elem35.read(iprot);
+-                this.cf_defs.add(_elem35);
++                CfDef _elem40;
++                _elem40 = new CfDef();
++                _elem40.read(iprot);
++                this.cf_defs.add(_elem40);
+               }
+               iprot.readListEnd();
+             }
+@@ -717,10 +717,10 @@
+         oprot.writeFieldBegin(STRATEGY_OPTIONS_FIELD_DESC);
+         {
+           oprot.writeMapBegin(new TMap(TType.STRING, TType.STRING, this.strategy_options.size()));
+-          for (Map.Entry<String, String> _iter36 : this.strategy_options.entrySet())
++          for (Map.Entry<String, String> _iter41 : this.strategy_options.entrySet())
+           {
+-            oprot.writeString(_iter36.getKey());
+-            oprot.writeString(_iter36.getValue());
++            oprot.writeString(_iter41.getKey());
++            oprot.writeString(_iter41.getValue());
+           }
+           oprot.writeMapEnd();
+         }
+@@ -734,9 +734,9 @@
+       oprot.writeFieldBegin(CF_DEFS_FIELD_DESC);
+       {
+         oprot.writeListBegin(new TList(TType.STRUCT, this.cf_defs.size()));
+-        for (CfDef _iter37 : this.cf_defs)
++        for (CfDef _iter42 : this.cf_defs)
+         {
+-          _iter37.write(oprot);
++          _iter42.write(oprot);
+         }
+         oprot.writeListEnd();
+       }
+Index: interface/thrift/gen-java/org/apache/cassandra/thrift/Cassandra.java
+===================================================================
+--- interface/thrift/gen-java/org/apache/cassandra/thrift/Cassandra.java	(revision 1057933)
++++ interface/thrift/gen-java/org/apache/cassandra/thrift/Cassandra.java	(revision )
+@@ -7138,14 +7138,14 @@
+           case 0: // SUCCESS
+             if (field.type == TType.LIST) {
+               {
+-                TList _list38 = iprot.readListBegin();
+-                this.success = new ArrayList<ColumnOrSuperColumn>(_list38.size);
+-                for (int _i39 = 0; _i39 < _list38.size; ++_i39)
++                TList _list43 = iprot.readListBegin();
++                this.success = new ArrayList<ColumnOrSuperColumn>(_list43.size);
++                for (int _i44 = 0; _i44 < _list43.size; ++_i44)
+                 {
+-                  ColumnOrSuperColumn _elem40;
+-                  _elem40 = new ColumnOrSuperColumn();
+-                  _elem40.read(iprot);
+-                  this.success.add(_elem40);
++                  ColumnOrSuperColumn _elem45;
++                  _elem45 = new ColumnOrSuperColumn();
++                  _elem45.read(iprot);
++                  this.success.add(_elem45);
+                 }
+                 iprot.readListEnd();
+               }
+@@ -7195,9 +7195,9 @@
+         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+         {
+           oprot.writeListBegin(new TList(TType.STRUCT, this.success.size()));
+-          for (ColumnOrSuperColumn _iter41 : this.success)
++          for (ColumnOrSuperColumn _iter46 : this.success)
+           {
+-            _iter41.write(oprot);
++            _iter46.write(oprot);
+           }
+           oprot.writeListEnd();
+         }
+@@ -8949,13 +8949,13 @@
+           case 1: // KEYS
+             if (field.type == TType.LIST) {
+               {
+-                TList _list42 = iprot.readListBegin();
+-                this.keys = new ArrayList<ByteBuffer>(_list42.size);
+-                for (int _i43 = 0; _i43 < _list42.size; ++_i43)
++                TList _list47 = iprot.readListBegin();
++                this.keys = new ArrayList<ByteBuffer>(_list47.size);
++                for (int _i48 = 0; _i48 < _list47.size; ++_i48)
+                 {
+-                  ByteBuffer _elem44;
+-                  _elem44 = iprot.readBinary();
+-                  this.keys.add(_elem44);
++                  ByteBuffer _elem49;
++                  _elem49 = iprot.readBinary();
++                  this.keys.add(_elem49);
+                 }
+                 iprot.readListEnd();
+               }
+@@ -9005,9 +9005,9 @@
+         oprot.writeFieldBegin(KEYS_FIELD_DESC);
+         {
+           oprot.writeListBegin(new TList(TType.STRING, this.keys.size()));
+-          for (ByteBuffer _iter45 : this.keys)
++          for (ByteBuffer _iter50 : this.keys)
+           {
+-            oprot.writeBinary(_iter45);
++            oprot.writeBinary(_iter50);
+           }
+           oprot.writeListEnd();
+         }
+@@ -9580,26 +9580,26 @@
+           case 0: // SUCCESS
+             if (field.type == TType.MAP) {
+               {
+-                TMap _map46 = iprot.readMapBegin();
+-                this.success = new HashMap<ByteBuffer,List<ColumnOrSuperColumn>>(2*_map46.size);
+-                for (int _i47 = 0; _i47 < _map46.size; ++_i47)
++                TMap _map51 = iprot.readMapBegin();
++                this.success = new HashMap<ByteBuffer,List<ColumnOrSuperColumn>>(2*_map51.size);
++                for (int _i52 = 0; _i52 < _map51.size; ++_i52)
+                 {
+-                  ByteBuffer _key48;
+-                  List<ColumnOrSuperColumn> _val49;
+-                  _key48 = iprot.readBinary();
++                  ByteBuffer _key53;
++                  List<ColumnOrSuperColumn> _val54;
++                  _key53 = iprot.readBinary();
+                   {
+-                    TList _list50 = iprot.readListBegin();
+-                    _val49 = new ArrayList<ColumnOrSuperColumn>(_list50.size);
+-                    for (int _i51 = 0; _i51 < _list50.size; ++_i51)
++                    TList _list55 = iprot.readListBegin();
++                    _val54 = new ArrayList<ColumnOrSuperColumn>(_list55.size);
++                    for (int _i56 = 0; _i56 < _list55.size; ++_i56)
+                     {
+-                      ColumnOrSuperColumn _elem52;
+-                      _elem52 = new ColumnOrSuperColumn();
+-                      _elem52.read(iprot);
+-                      _val49.add(_elem52);
++                      ColumnOrSuperColumn _elem57;
++                      _elem57 = new ColumnOrSuperColumn();
++                      _elem57.read(iprot);
++                      _val54.add(_elem57);
+                     }
+                     iprot.readListEnd();
+                   }
+-                  this.success.put(_key48, _val49);
++                  this.success.put(_key53, _val54);
+                 }
+                 iprot.readMapEnd();
+               }
+@@ -9649,14 +9649,14 @@
+         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+         {
+           oprot.writeMapBegin(new TMap(TType.STRING, TType.LIST, this.success.size()));
+-          for (Map.Entry<ByteBuffer, List<ColumnOrSuperColumn>> _iter53 : this.success.entrySet())
++          for (Map.Entry<ByteBuffer, List<ColumnOrSuperColumn>> _iter58 : this.success.entrySet())
+           {
+-            oprot.writeBinary(_iter53.getKey());
++            oprot.writeBinary(_iter58.getKey());
+             {
+-              oprot.writeListBegin(new TList(TType.STRUCT, _iter53.getValue().size()));
+-              for (ColumnOrSuperColumn _iter54 : _iter53.getValue())
++              oprot.writeListBegin(new TList(TType.STRUCT, _iter58.getValue().size()));
++              for (ColumnOrSuperColumn _iter59 : _iter58.getValue())
+               {
+-                _iter54.write(oprot);
++                _iter59.write(oprot);
+               }
+               oprot.writeListEnd();
+             }
+@@ -10228,13 +10228,13 @@
+           case 1: // KEYS
+             if (field.type == TType.LIST) {
+               {
+-                TList _list55 = iprot.readListBegin();
+-                this.keys = new ArrayList<ByteBuffer>(_list55.size);
+-                for (int _i56 = 0; _i56 < _list55.size; ++_i56)
++                TList _list60 = iprot.readListBegin();
++                this.keys = new ArrayList<ByteBuffer>(_list60.size);
++                for (int _i61 = 0; _i61 < _list60.size; ++_i61)
+                 {
+-                  ByteBuffer _elem57;
+-                  _elem57 = iprot.readBinary();
+-                  this.keys.add(_elem57);
++                  ByteBuffer _elem62;
++                  _elem62 = iprot.readBinary();
++                  this.keys.add(_elem62);
+                 }
+                 iprot.readListEnd();
+               }
+@@ -10284,9 +10284,9 @@
+         oprot.writeFieldBegin(KEYS_FIELD_DESC);
+         {
+           oprot.writeListBegin(new TList(TType.STRING, this.keys.size()));
+-          for (ByteBuffer _iter58 : this.keys)
++          for (ByteBuffer _iter63 : this.keys)
+           {
+-            oprot.writeBinary(_iter58);
++            oprot.writeBinary(_iter63);
+           }
+           oprot.writeListEnd();
+         }
+@@ -10855,15 +10855,15 @@
+           case 0: // SUCCESS
+             if (field.type == TType.MAP) {
+               {
+-                TMap _map59 = iprot.readMapBegin();
+-                this.success = new HashMap<ByteBuffer,Integer>(2*_map59.size);
+-                for (int _i60 = 0; _i60 < _map59.size; ++_i60)
++                TMap _map64 = iprot.readMapBegin();
++                this.success = new HashMap<ByteBuffer,Integer>(2*_map64.size);
++                for (int _i65 = 0; _i65 < _map64.size; ++_i65)
+                 {
+-                  ByteBuffer _key61;
+-                  int _val62;
+-                  _key61 = iprot.readBinary();
+-                  _val62 = iprot.readI32();
+-                  this.success.put(_key61, _val62);
++                  ByteBuffer _key66;
++                  int _val67;
++                  _key66 = iprot.readBinary();
++                  _val67 = iprot.readI32();
++                  this.success.put(_key66, _val67);
+                 }
+                 iprot.readMapEnd();
+               }
+@@ -10913,10 +10913,10 @@
+         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+         {
+           oprot.writeMapBegin(new TMap(TType.STRING, TType.I32, this.success.size()));
+-          for (Map.Entry<ByteBuffer, Integer> _iter63 : this.success.entrySet())
++          for (Map.Entry<ByteBuffer, Integer> _iter68 : this.success.entrySet())
+           {
+-            oprot.writeBinary(_iter63.getKey());
+-            oprot.writeI32(_iter63.getValue());
++            oprot.writeBinary(_iter68.getKey());
++            oprot.writeI32(_iter68.getValue());
+           }
+           oprot.writeMapEnd();
+         }
+@@ -12068,14 +12068,14 @@
+           case 0: // SUCCESS
+             if (field.type == TType.LIST) {
+               {
+-                TList _list64 = iprot.readListBegin();
+-                this.success = new ArrayList<KeySlice>(_list64.size);
+-                for (int _i65 = 0; _i65 < _list64.size; ++_i65)
++                TList _list69 = iprot.readListBegin();
++                this.success = new ArrayList<KeySlice>(_list69.size);
++                for (int _i70 = 0; _i70 < _list69.size; ++_i70)
+                 {
+-                  KeySlice _elem66;
+-                  _elem66 = new KeySlice();
+-                  _elem66.read(iprot);
+-                  this.success.add(_elem66);
++                  KeySlice _elem71;
++                  _elem71 = new KeySlice();
++                  _elem71.read(iprot);
++                  this.success.add(_elem71);
+                 }
+                 iprot.readListEnd();
+               }
+@@ -12125,9 +12125,9 @@
+         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+         {
+           oprot.writeListBegin(new TList(TType.STRUCT, this.success.size()));
+-          for (KeySlice _iter67 : this.success)
++          for (KeySlice _iter72 : this.success)
+           {
+-            _iter67.write(oprot);
++            _iter72.write(oprot);
+           }
+           oprot.writeListEnd();
+         }
+@@ -13279,14 +13279,14 @@
+           case 0: // SUCCESS
+             if (field.type == TType.LIST) {
+               {
+-                TList _list68 = iprot.readListBegin();
+-                this.success = new ArrayList<KeySlice>(_list68.size);
+-                for (int _i69 = 0; _i69 < _list68.size; ++_i69)
++                TList _list73 = iprot.readListBegin();
++                this.success = new ArrayList<KeySlice>(_list73.size);
++                for (int _i74 = 0; _i74 < _list73.size; ++_i74)
+                 {
+-                  KeySlice _elem70;
+-                  _elem70 = new KeySlice();
+-                  _elem70.read(iprot);
+-                  this.success.add(_elem70);
++                  KeySlice _elem75;
++                  _elem75 = new KeySlice();
++                  _elem75.read(iprot);
++                  this.success.add(_elem75);
+                 }
+                 iprot.readListEnd();
+               }
+@@ -13336,9 +13336,9 @@
+         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+         {
+           oprot.writeListBegin(new TList(TType.STRUCT, this.success.size()));
+-          for (KeySlice _iter71 : this.success)
++          for (KeySlice _iter76 : this.success)
+           {
+-            _iter71.write(oprot);
++            _iter76.write(oprot);
+           }
+           oprot.writeListEnd();
+         }
+@@ -15955,38 +15955,38 @@
+           case 1: // MUTATION_MAP
+             if (field.type == TType.MAP) {
+               {
+-                TMap _map72 = iprot.readMapBegin();
+-                this.mutation_map = new HashMap<ByteBuffer,Map<String,List<Mutation>>>(2*_map72.size);
+-                for (int _i73 = 0; _i73 < _map72.size; ++_i73)
++                TMap _map77 = iprot.readMapBegin();
++                this.mutation_map = new HashMap<ByteBuffer,Map<String,List<Mutation>>>(2*_map77.size);
++                for (int _i78 = 0; _i78 < _map77.size; ++_i78)
+                 {
+-                  ByteBuffer _key74;
+-                  Map<String,List<Mutation>> _val75;
+-                  _key74 = iprot.readBinary();
++                  ByteBuffer _key79;
++                  Map<String,List<Mutation>> _val80;
++                  _key79 = iprot.readBinary();
+                   {
+-                    TMap _map76 = iprot.readMapBegin();
+-                    _val75 = new HashMap<String,List<Mutation>>(2*_map76.size);
+-                    for (int _i77 = 0; _i77 < _map76.size; ++_i77)
++                    TMap _map81 = iprot.readMapBegin();
++                    _val80 = new HashMap<String,List<Mutation>>(2*_map81.size);
++                    for (int _i82 = 0; _i82 < _map81.size; ++_i82)
+                     {
+-                      String _key78;
+-                      List<Mutation> _val79;
+-                      _key78 = iprot.readString();
++                      String _key83;
++                      List<Mutation> _val84;
++                      _key83 = iprot.readString();
+                       {
+-                        TList _list80 = iprot.readListBegin();
+-                        _val79 = new ArrayList<Mutation>(_list80.size);
+-                        for (int _i81 = 0; _i81 < _list80.size; ++_i81)
++                        TList _list85 = iprot.readListBegin();
++                        _val84 = new ArrayList<Mutation>(_list85.size);
++                        for (int _i86 = 0; _i86 < _list85.size; ++_i86)
+                         {
+-                          Mutation _elem82;
+-                          _elem82 = new Mutation();
+-                          _elem82.read(iprot);
+-                          _val79.add(_elem82);
++                          Mutation _elem87;
++                          _elem87 = new Mutation();
++                          _elem87.read(iprot);
++                          _val84.add(_elem87);
+                         }
+                         iprot.readListEnd();
+                       }
+-                      _val75.put(_key78, _val79);
++                      _val80.put(_key83, _val84);
+                     }
+                     iprot.readMapEnd();
+                   }
+-                  this.mutation_map.put(_key74, _val75);
++                  this.mutation_map.put(_key79, _val80);
+                 }
+                 iprot.readMapEnd();
+               }
+@@ -16020,19 +16020,19 @@
+         oprot.writeFieldBegin(MUTATION_MAP_FIELD_DESC);
+         {
+           oprot.writeMapBegin(new TMap(TType.STRING, TType.MAP, this.mutation_map.size()));
+-          for (Map.Entry<ByteBuffer, Map<String,List<Mutation>>> _iter83 : this.mutation_map.entrySet())
++          for (Map.Entry<ByteBuffer, Map<String,List<Mutation>>> _iter88 : this.mutation_map.entrySet())
+           {
+-            oprot.writeBinary(_iter83.getKey());
++            oprot.writeBinary(_iter88.getKey());
+             {
+-              oprot.writeMapBegin(new TMap(TType.STRING, TType.LIST, _iter83.getValue().size()));
+-              for (Map.Entry<String, List<Mutation>> _iter84 : _iter83.getValue().entrySet())
++              oprot.writeMapBegin(new TMap(TType.STRING, TType.LIST, _iter88.getValue().size()));
++              for (Map.Entry<String, List<Mutation>> _iter89 : _iter88.getValue().entrySet())
+               {
+-                oprot.writeString(_iter84.getKey());
++                oprot.writeString(_iter89.getKey());
+                 {
+-                  oprot.writeListBegin(new TList(TType.STRUCT, _iter84.getValue().size()));
+-                  for (Mutation _iter85 : _iter84.getValue())
++                  oprot.writeListBegin(new TList(TType.STRUCT, _iter89.getValue().size()));
++                  for (Mutation _iter90 : _iter89.getValue())
+                   {
+-                    _iter85.write(oprot);
++                    _iter90.write(oprot);
+                   }
+                   oprot.writeListEnd();
+                 }
+@@ -17767,25 +17767,25 @@
+           case 0: // SUCCESS
+             if (field.type == TType.MAP) {
+               {
+-                TMap _map86 = iprot.readMapBegin();
+-                this.success = new HashMap<String,List<String>>(2*_map86.size);
+-                for (int _i87 = 0; _i87 < _map86.size; ++_i87)
++                TMap _map91 = iprot.readMapBegin();
++                this.success = new HashMap<String,List<String>>(2*_map91.size);
++                for (int _i92 = 0; _i92 < _map91.size; ++_i92)
+                 {
+-                  String _key88;
+-                  List<String> _val89;
+-                  _key88 = iprot.readString();
++                  String _key93;
++                  List<String> _val94;
++                  _key93 = iprot.readString();
+                   {
+-                    TList _list90 = iprot.readListBegin();
+-                    _val89 = new ArrayList<String>(_list90.size);
+-                    for (int _i91 = 0; _i91 < _list90.size; ++_i91)
++                    TList _list95 = iprot.readListBegin();
++                    _val94 = new ArrayList<String>(_list95.size);
++                    for (int _i96 = 0; _i96 < _list95.size; ++_i96)
+                     {
+-                      String _elem92;
+-                      _elem92 = iprot.readString();
+-                      _val89.add(_elem92);
++                      String _elem97;
++                      _elem97 = iprot.readString();
++                      _val94.add(_elem97);
+                     }
+                     iprot.readListEnd();
+                   }
+-                  this.success.put(_key88, _val89);
++                  this.success.put(_key93, _val94);
+                 }
+                 iprot.readMapEnd();
+               }
+@@ -17819,14 +17819,14 @@
+         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+         {
+           oprot.writeMapBegin(new TMap(TType.STRING, TType.LIST, this.success.size()));
+-          for (Map.Entry<String, List<String>> _iter93 : this.success.entrySet())
++          for (Map.Entry<String, List<String>> _iter98 : this.success.entrySet())
+           {
+-            oprot.writeString(_iter93.getKey());
++            oprot.writeString(_iter98.getKey());
+             {
+-              oprot.writeListBegin(new TList(TType.STRING, _iter93.getValue().size()));
+-              for (String _iter94 : _iter93.getValue())
++              oprot.writeListBegin(new TList(TType.STRING, _iter98.getValue().size()));
++              for (String _iter99 : _iter98.getValue())
+               {
+-                oprot.writeString(_iter94);
++                oprot.writeString(_iter99);
+               }
+               oprot.writeListEnd();
+             }
+@@ -18393,14 +18393,14 @@
+           case 0: // SUCCESS
+             if (field.type == TType.LIST) {
+               {
+-                TList _list95 = iprot.readListBegin();
+-                this.success = new ArrayList<KsDef>(_list95.size);
+-                for (int _i96 = 0; _i96 < _list95.size; ++_i96)
++                TList _list100 = iprot.readListBegin();
++                this.success = new ArrayList<KsDef>(_list100.size);
++                for (int _i101 = 0; _i101 < _list100.size; ++_i101)
+                 {
+-                  KsDef _elem97;
+-                  _elem97 = new KsDef();
+-                  _elem97.read(iprot);
+-                  this.success.add(_elem97);
++                  KsDef _elem102;
++                  _elem102 = new KsDef();
++                  _elem102.read(iprot);
++                  this.success.add(_elem102);
+                 }
+                 iprot.readListEnd();
+               }
+@@ -18434,9 +18434,9 @@
+         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+         {
+           oprot.writeListBegin(new TList(TType.STRUCT, this.success.size()));
+-          for (KsDef _iter98 : this.success)
++          for (KsDef _iter103 : this.success)
+           {
+-            _iter98.write(oprot);
++            _iter103.write(oprot);
+           }
+           oprot.writeListEnd();
+         }
+@@ -20053,14 +20053,14 @@
+           case 0: // SUCCESS
+             if (field.type == TType.LIST) {
+               {
+-                TList _list99 = iprot.readListBegin();
+-                this.success = new ArrayList<TokenRange>(_list99.size);
+-                for (int _i100 = 0; _i100 < _list99.size; ++_i100)
++                TList _list104 = iprot.readListBegin();
++                this.success = new ArrayList<TokenRange>(_list104.size);
++                for (int _i105 = 0; _i105 < _list104.size; ++_i105)
+                 {
+-                  TokenRange _elem101;
+-                  _elem101 = new TokenRange();
+-                  _elem101.read(iprot);
+-                  this.success.add(_elem101);
++                  TokenRange _elem106;
++                  _elem106 = new TokenRange();
++                  _elem106.read(iprot);
++                  this.success.add(_elem106);
+                 }
+                 iprot.readListEnd();
+               }
+@@ -20094,9 +20094,9 @@
+         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+         {
+           oprot.writeListBegin(new TList(TType.STRUCT, this.success.size()));
+-          for (TokenRange _iter102 : this.success)
++          for (TokenRange _iter107 : this.success)
+           {
+-            _iter102.write(oprot);
++            _iter107.write(oprot);
+           }
+           oprot.writeListEnd();
+         }
+@@ -22696,13 +22696,13 @@
+           case 0: // SUCCESS
+             if (field.type == TType.LIST) {
+               {
+-                TList _list103 = iprot.readListBegin();
+-                this.success = new ArrayList<String>(_list103.size);
+-                for (int _i104 = 0; _i104 < _list103.size; ++_i104)
++                TList _list108 = iprot.readListBegin();
++                this.success = new ArrayList<String>(_list108.size);
++                for (int _i109 = 0; _i109 < _list108.size; ++_i109)
+                 {
+-                  String _elem105;
+-                  _elem105 = iprot.readString();
+-                  this.success.add(_elem105);
++                  String _elem110;
++                  _elem110 = iprot.readString();
++                  this.success.add(_elem110);
+                 }
+                 iprot.readListEnd();
+               }
+@@ -22728,9 +22728,9 @@
+         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+         {
+           oprot.writeListBegin(new TList(TType.STRING, this.success.size()));
+-          for (String _iter106 : this.success)
++          for (String _iter111 : this.success)
+           {
+-            oprot.writeString(_iter106);
++            oprot.writeString(_iter111);
+           }
+           oprot.writeListEnd();
+         }
+Index: src/java/org/apache/cassandra/config/RawColumnFamily.java
+===================================================================
+--- src/java/org/apache/cassandra/config/RawColumnFamily.java	(revision 1026429)
++++ src/java/org/apache/cassandra/config/RawColumnFamily.java	(revision )
+@@ -23,6 +23,8 @@
+ 
+ import org.apache.cassandra.db.ColumnFamilyType;
+ 
++import java.util.Map;
++
+ /**
+  * @deprecated Yaml configuration for Keyspaces and ColumnFamilies is deprecated in 0.7
+  */
+@@ -33,7 +35,9 @@
+     public String compare_with;
+     public String compare_subcolumns_with;
+     public String comment;
+-    public double rows_cached = CFMetaData.DEFAULT_ROW_CACHE_SIZE; 
++    public double rows_cached = CFMetaData.DEFAULT_ROW_CACHE_SIZE;
++    public String row_cache_filter;
++    public Map<String, ?> row_cache_filter_params;
+     public double keys_cached = CFMetaData.DEFAULT_KEY_CACHE_SIZE; 
+     public double read_repair_chance = CFMetaData.DEFAULT_READ_REPAIR_CHANCE;
+     public int gc_grace_seconds = CFMetaData.DEFAULT_GC_GRACE_SECONDS;
+Index: conf/cassandra.yaml
+===================================================================
+--- conf/cassandra.yaml	(revision 1063441)
++++ conf/cassandra.yaml	(revision )
+@@ -418,6 +418,8 @@
+         - name: Standard1
+           compare_with: BytesType
+           keys_cached: 10000
++          row_cache_filter: TailRowCacheFilter
++          row_cache_filter_params: {limit: 100, reversed: false}          
+           rows_cached: 1000
+           row_cache_save_period_in_seconds: 0
+           key_cache_save_period_in_seconds: 3600
+Index: test/unit/org/apache/cassandra/cache/TailRowCacheFilterTest.java
+===================================================================
+--- test/unit/org/apache/cassandra/cache/TailRowCacheFilterTest.java	(revision )
++++ test/unit/org/apache/cassandra/cache/TailRowCacheFilterTest.java	(revision )
+@@ -0,0 +1,253 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.cache;
++
++import org.apache.cassandra.db.*;
++import org.apache.cassandra.db.filter.NamesQueryFilter;
++import org.apache.cassandra.db.filter.QueryFilter;
++import org.apache.cassandra.db.filter.QueryPath;
++import org.apache.cassandra.db.filter.SliceQueryFilter;
++import org.apache.cassandra.db.marshal.BytesType;
++import org.apache.cassandra.dht.BigIntegerToken;
++import org.apache.cassandra.utils.FBUtilities;
++
++import org.junit.Test;
++
++import java.nio.ByteBuffer;
++import java.util.*;
++
++import static org.apache.commons.lang.ArrayUtils.EMPTY_BYTE_ARRAY;
++
++public class TailRowCacheFilterTest 
++{
++    private static final DecoratedKey ROW_KEY = getKey(); 
++
++    @Test
++    public void testCacheHit()
++    {
++        TailRowCacheFilter cacheFilter = createFilter(10, false);
++        ColumnFamily cachedRow = fillColumnFamily(
++                createColumnFamily(), 
++                createColumns(1, 10, 1));
++
++        // !reversed tests 
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(EMPTY_BYTE_ARRAY, EMPTY_BYTE_ARRAY, false, 10), gcBefore()) != null;
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(EMPTY_BYTE_ARRAY, EMPTY_BYTE_ARRAY, true, 10), gcBefore()) == null;
++        
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(EMPTY_BYTE_ARRAY, array(10), false, 11), gcBefore()) != null;
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(EMPTY_BYTE_ARRAY, array(11), false, 11), gcBefore()) == null;
++        
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(EMPTY_BYTE_ARRAY, array(5), false, 11), gcBefore()) != null;
++        
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(array(5), array(10), false, 11), gcBefore()) != null;
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(array(0), array(10), false, 11), gcBefore()) != null;
++
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(EMPTY_BYTE_ARRAY, EMPTY_BYTE_ARRAY, false, 11), gcBefore()) == null;
++
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(array(8), EMPTY_BYTE_ARRAY, false, 3), gcBefore()) != null;        
++        cachedRow.addTombstone(buffer(9), currentTimeSecs(), System.currentTimeMillis());
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(array(8), EMPTY_BYTE_ARRAY, false, 3), gcBefore()) == null;
++        
++        cacheFilter = createFilter(10, true);
++        cachedRow = fillColumnFamily(
++                createColumnFamily(), 
++                createColumns(1, 10, 1));
++        
++        // reversed tests 
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(EMPTY_BYTE_ARRAY, EMPTY_BYTE_ARRAY, true, 10), gcBefore()) != null;
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(EMPTY_BYTE_ARRAY, EMPTY_BYTE_ARRAY, false, 10), gcBefore()) == null;
++        
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(EMPTY_BYTE_ARRAY, array(10), true, 11), gcBefore()) != null;
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(EMPTY_BYTE_ARRAY, array(11), true, 11), gcBefore()) == null;
++        
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(EMPTY_BYTE_ARRAY, array(5), true, 11), gcBefore()) != null;
++        
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(array(10), array(5), true, 11), gcBefore()) != null;
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(array(11), array(5), true, 11), gcBefore()) != null;
++                
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(EMPTY_BYTE_ARRAY, EMPTY_BYTE_ARRAY, true, 11), gcBefore()) == null;
++        
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(array(3), EMPTY_BYTE_ARRAY, true, 3), gcBefore()) != null;
++        cachedRow.addTombstone(buffer(2), currentTimeSecs(), System.currentTimeMillis());
++        assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(array(3), EMPTY_BYTE_ARRAY, true, 3), gcBefore()) == null;
++        
++        
++        cacheFilter = createFilter(10, false);
++        cachedRow = fillColumnFamily(
++                createColumnFamily(), 
++                createColumns(1, 10, 1));
++        
++        // test some column querries (non reversed)
++        assert cacheFilter.filterColumnFamily(cachedRow, createNameFilter(array(1), array(3)), gcBefore()) != null;
++        assert cacheFilter.filterColumnFamily(cachedRow, createNameFilter(array(0), array(3)), gcBefore()) != null;
++        assert cacheFilter.filterColumnFamily(cachedRow, createNameFilter(array(1), array(11)), gcBefore()) == null;
++
++        cacheFilter = createFilter(10, true);
++        cachedRow = fillColumnFamily(
++                createColumnFamily(), 
++                createColumns(1, 10, 1));
++        
++        // reversed tests 
++        assert cacheFilter.filterColumnFamily(cachedRow, createNameFilter(array(1), array(3)), gcBefore()) != null;
++        assert cacheFilter.filterColumnFamily(cachedRow, createNameFilter(array(0), array(3)), gcBefore()) == null;
++        assert cacheFilter.filterColumnFamily(cachedRow, createNameFilter(array(1), array(11)), gcBefore()) != null;
++    }
++    
++    @Test
++    public void testApplyUpdate()
++    {
++        TailRowCacheFilter cacheFilter = createFilter(10, false);
++        ColumnFamily cachedRow = fillColumnFamily(
++                createColumnFamily(), 
++                createColumns(0, 10, 2));
++        
++        
++        // overfill by one
++        cacheFilter.applyUpdate(ROW_KEY, cachedRow, fillColumnFamily(createColumnFamily(), createColumns(12, 20, 2)), gcBefore());
++        
++        assert cachedRow.getEstimatedColumnCount() == 10 : cachedRow.getEstimatedColumnCount();
++        // 20 got dropped
++        assert cachedRow.getColumnsMap().lastKey().get(0) == 18;
++        
++        cacheFilter.applyUpdate(ROW_KEY, cachedRow, fillColumnFamily(createColumnFamily(), createColumns(1, 10, 2)), gcBefore());
++
++        assert cachedRow.getEstimatedColumnCount() == 10 : cachedRow.getEstimatedColumnCount();
++        assert cachedRow.getColumnsMap().lastKey().get(0) == 9;
++    }
++
++    @Test
++    // this is not a real test. just debug code to meassure performance impact of the applyUpdate method
++    public void comparePerformance() throws InterruptedException
++    {
++        ColumnFamily cachedRow = fillColumnFamily(
++                createColumnFamily(), 
++                createColumns(0, 1000000, 2));
++        final TailRowCacheFilter cacheFilter = createFilter(100000, false);
++        long start = System.currentTimeMillis();
++        for (int x = 0; x < 1000; x++)
++        for (int i = 0; i < 9000; i++)
++        {
++            assert cacheFilter.filterColumnFamily(cachedRow, createSliceFilter(array(i * 10), EMPTY_BYTE_ARRAY, false, 10), gcBefore()) != null;
++            cacheFilter.applyUpdate(ROW_KEY, cachedRow, fillColumnFamily(createColumnFamily(), createColumns(i*2+1, i*2+1, 1)), gcBefore());
++        }
++        long tailFilterTime = System.currentTimeMillis() - start;
++        
++        cachedRow = fillColumnFamily(
++                createColumnFamily(), 
++                createColumns(0, 1000000, 2));
++        
++        start = System.currentTimeMillis();
++        for (int x = 0; x < 1000; x++)
++        for (int i = 0; i < 9000; i++)
++        {
++            assert IdentityRowCacheFilter.instance.filterColumnFamily(cachedRow, createSliceFilter(array(i * 10), EMPTY_BYTE_ARRAY, false, 10), gcBefore()) != null;
++            IdentityRowCacheFilter.instance.applyUpdate(ROW_KEY, cachedRow, fillColumnFamily(createColumnFamily(), createColumns(i*2+1, i*2+1, 1)), gcBefore());
++        }
++        long identityFilterTime = System.currentTimeMillis() - start;
++
++        System.out.println("tailfiltertime: " + tailFilterTime);
++        System.out.println("identityFilterTime: " + identityFilterTime);
++        // keep alive for profiling ...
++        Thread.sleep(100000);
++    }
++
++    private ColumnFamily createColumnFamily()
++    {
++        return new ColumnFamily(ColumnFamilyType.Standard, BytesType.instance, null, 1);
++    }
++
++    private QueryFilter createNameFilter(byte[] ... name) 
++    {
++        TreeSet<ByteBuffer> columns = new TreeSet<ByteBuffer>(BytesType.instance);
++        for (byte[] bytes : name)
++            columns.add(ByteBuffer.wrap(bytes));
++
++        return new QueryFilter(ROW_KEY, new QueryPath("test"), new NamesQueryFilter(columns));   
++    }
++    
++    private QueryFilter createSliceFilter(byte[] start, byte[] finish, boolean reversed, int count) 
++    {        
++        return new QueryFilter(ROW_KEY, new QueryPath("Test"), new SliceQueryFilter(ByteBuffer.wrap(start), ByteBuffer.wrap(finish), reversed, count));
++    }
++
++    private ColumnFamily fillColumnFamily(ColumnFamily columnFamily, List<Column> columns)
++    {
++        for (Column column : columns) {
++            columnFamily.addColumn(column);
++        }
++        return columnFamily;
++    }
++    
++    private static List<Column> createColumns(int start, int finish, int stepping) 
++    {
++        ArrayList<Column> columns = new ArrayList<Column>();
++        for (int i = start; i <= finish; i += stepping)
++        {
++            columns.add(new Column(ByteBuffer.wrap(array(i)), ByteBuffer.wrap(EMPTY_BYTE_ARRAY), System.currentTimeMillis()));
++        }
++        return columns;
++    }
++    
++    private static ByteBuffer buffer(int i)
++    {
++        return ByteBuffer.wrap(array(i));
++    }
++
++    private static byte[] array(int i)
++    {
++        return array(new byte[]{(byte) i});
++    }
++    
++    private static byte[] array(byte ... i)
++    {
++        return i;
++    }
++
++    private TailRowCacheFilter createFilter(int limit, boolean reversed) 
++    {
++        HashMap<String, String> params = new HashMap<String, String>();
++        params.put(TailRowCacheFilter.ROW_CACHE_LIMIT, String.valueOf(limit));
++        params.put(TailRowCacheFilter.ROW_CACHE_REVERSED, String.valueOf(reversed));
++        return new TailRowCacheFilter(params);
++    }
++    
++    
++    private static DecoratedKey getKey() {
++        ByteBuffer key = ByteBuffer.wrap(new byte[]{1});
++        return new DecoratedKey<BigIntegerToken>(getToken(key), key);
++    }
++    
++    private static BigIntegerToken getToken(ByteBuffer key)
++    {
++        if (key.remaining() == 0)
++            return new BigIntegerToken("-1");
++        return new BigIntegerToken(FBUtilities.hashToBigInteger(key));
++    }
++    
++    private int gcBefore()
++    {
++        return currentTimeSecs() - 864000;
++    }
++
++    private static int currentTimeSecs()
++    {
++        return (int) (System.currentTimeMillis() / 1000);
++    }
++
++}
+Index: src/java/org/apache/cassandra/thrift/CassandraServer.java
+===================================================================
+--- src/java/org/apache/cassandra/thrift/CassandraServer.java	(revision 1060447)
++++ src/java/org/apache/cassandra/thrift/CassandraServer.java	(revision )
+@@ -865,6 +865,7 @@
+                               DatabaseDescriptor.getComparator(cf_def.comparator_type),
+                               cf_def.subcomparator_type == null ? null : DatabaseDescriptor.getComparator(cf_def.subcomparator_type),
+                               cf_def.comment,
++                              DatabaseDescriptor.getRowCacheFilter(cf_def.row_cache_filter, cf_def.row_cache_filter_params),
+                               cf_def.row_cache_size,
+                               cf_def.key_cache_size,
+                               cf_def.read_repair_chance,
+Index: interface/cassandra.genavro
+===================================================================
+--- interface/cassandra.genavro	(revision 1027174)
++++ interface/cassandra.genavro	(revision )
+@@ -143,6 +143,8 @@
+         union { string, null } comparator_type;
+         union { string, null } subcomparator_type;
+         union { string, null } comment;
++        union { string, null } row_cache_filter;
++        union { map<string>, null } row_cache_filter_params;
+         union { double, null } row_cache_size;
+         union { double, null } key_cache_size;
+         union { double, null } read_repair_chance;
+Index: src/java/org/apache/cassandra/service/AbstractCassandraDaemon.java
+===================================================================
+--- src/java/org/apache/cassandra/service/AbstractCassandraDaemon.java	(revision 1064181)
++++ src/java/org/apache/cassandra/service/AbstractCassandraDaemon.java	(revision )
+@@ -190,7 +190,7 @@
+         }
+         catch (ConfigurationException e)
+         {
+-            logger.error("Fatal error: " + e.getMessage());
++            logger.error("Fatal error: " + e.getMessage(), e);
+             System.err.println("Bad configuration; unable to start server");
+             System.exit(1);
+         }
+Index: src/java/org/apache/cassandra/avro/CassandraServer.java
+===================================================================
+--- src/java/org/apache/cassandra/avro/CassandraServer.java	(revision 1060447)
++++ src/java/org/apache/cassandra/avro/CassandraServer.java	(revision )
+@@ -38,6 +38,7 @@
+ import org.apache.avro.util.Utf8;
+ import org.apache.cassandra.auth.AllowAllAuthenticator;
+ import org.apache.cassandra.auth.Permission;
++import org.apache.cassandra.cache.RowCacheFilter;
+ import org.apache.cassandra.concurrent.Stage;
+ import org.apache.cassandra.concurrent.StageManager;
+ import org.apache.cassandra.config.*;
+@@ -804,12 +805,25 @@
+         CFMetaData.validateMinMaxCompactionThresholds(cf_def);
+         CFMetaData.validateMemtableSettings(cf_def);
+ 
++
++        HashMap<String, String> filterParams = new HashMap<String, String>();
++        if (cf_def.row_cache_filter_params != null)
++        {
++            for (Map.Entry<CharSequence, CharSequence> entry : cf_def.row_cache_filter_params.entrySet())
++            {
++                filterParams.put(entry.getKey().toString(), entry.getValue().toString());
++            }
++        }
++        RowCacheFilter rowCacheFilter = DatabaseDescriptor.getRowCacheFilter(
++                cf_def.row_cache_filter != null ? cf_def.row_cache_filter.toString() : null, filterParams);
++
+         return new CFMetaData(cf_def.keyspace.toString(),
+                               cf_def.name.toString(),
+                               ColumnFamilyType.create(cfType),
+                               DatabaseDescriptor.getComparator(compare),
+                               subCompare.length() == 0 ? null : DatabaseDescriptor.getComparator(subCompare),
+                               cf_def.comment == null ? "" : cf_def.comment.toString(),
++                              rowCacheFilter,
+                               cf_def.row_cache_size == null ? CFMetaData.DEFAULT_ROW_CACHE_SIZE : cf_def.row_cache_size,
+                               cf_def.key_cache_size == null ? CFMetaData.DEFAULT_KEY_CACHE_SIZE : cf_def.key_cache_size,
+                               cf_def.read_repair_chance == null ? CFMetaData.DEFAULT_READ_REPAIR_CHANCE : cf_def.read_repair_chance,
+Index: interface/cassandra.thrift
+===================================================================
+--- interface/cassandra.thrift	(revision 1027174)
++++ interface/cassandra.thrift	(revision )
+@@ -333,19 +333,21 @@
+     6: optional string subcomparator_type,
+     8: optional string comment,
+     9: optional double row_cache_size=0,
+-    11: optional double key_cache_size=200000,
+-    12: optional double read_repair_chance=1.0,
+-    13: optional list<ColumnDef> column_metadata,
+-    14: optional i32 gc_grace_seconds,
+-    15: optional string default_validation_class,
+-    16: optional i32 id,
+-    17: optional i32 min_compaction_threshold,
+-    18: optional i32 max_compaction_threshold,
+-    19: optional i32 row_cache_save_period_in_seconds,
+-    20: optional i32 key_cache_save_period_in_seconds,
+-    21: optional i32 memtable_flush_after_mins,
+-    22: optional i32 memtable_throughput_in_mb,
+-    23: optional double memtable_operations_in_millions,
++    10: optional string row_cache_filter="IdentityRowCacheFilter",
++    11: optional map<string,string> row_cache_filter_params,
++    12: optional double key_cache_size=200000,
++    13: optional double read_repair_chance=1.0,
++    14: optional list<ColumnDef> column_metadata,
++    15: optional i32 gc_grace_seconds,
++    16: optional string default_validation_class,
++    17: optional i32 id,
++    18: optional i32 min_compaction_threshold,
++    19: optional i32 max_compaction_threshold,
++    20: optional i32 row_cache_save_period_in_seconds,
++    21: optional i32 key_cache_save_period_in_seconds,
++    22: optional i32 memtable_flush_after_mins,
++    23: optional i32 memtable_throughput_in_mb,
++    24: optional double memtable_operations_in_millions,
+ }
+ 
+ /* describes a keyspace. */

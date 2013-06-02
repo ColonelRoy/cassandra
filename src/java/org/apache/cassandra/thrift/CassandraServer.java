@@ -865,6 +865,7 @@ public class CassandraServer implements Cassandra.Iface
                               DatabaseDescriptor.getComparator(cf_def.comparator_type),
                               cf_def.subcomparator_type == null ? null : DatabaseDescriptor.getComparator(cf_def.subcomparator_type),
                               cf_def.comment,
+                              DatabaseDescriptor.getRowCacheFilter(cf_def.row_cache_filter, cf_def.row_cache_filter_params),
                               cf_def.row_cache_size,
                               cf_def.key_cache_size,
                               cf_def.read_repair_chance,

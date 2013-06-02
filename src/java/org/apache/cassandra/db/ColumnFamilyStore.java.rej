@@ -1,0 +1,12 @@
+--- src/java/org/apache/cassandra/db/ColumnFamilyStore.java	(revision 1060921)
++++ src/java/org/apache/cassandra/db/ColumnFamilyStore.java	(revision )
+@@ -1103,8 +1108,7 @@
+         ColumnFamily cached;
+         if ((cached = ssTables.getRowCache().get(key)) == null)
+         {
+-            cached = getTopLevelColumns(QueryFilter.getIdentityFilter(key, new QueryPath(columnFamily)), Integer.MIN_VALUE);
+-
++            cached = getTopLevelColumns(rowCacheFilter.createQueryFilter(key, columnFamily), Integer.MIN_VALUE);
+             if (cached == null)
+             {
+                 return null;

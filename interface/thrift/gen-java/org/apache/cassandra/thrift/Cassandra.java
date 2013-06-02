@@ -7138,14 +7138,14 @@ public class Cassandra {
           case 0: // SUCCESS
             if (field.type == TType.LIST) {
               {
-                TList _list38 = iprot.readListBegin();
-                this.success = new ArrayList<ColumnOrSuperColumn>(_list38.size);
-                for (int _i39 = 0; _i39 < _list38.size; ++_i39)
+                TList _list43 = iprot.readListBegin();
+                this.success = new ArrayList<ColumnOrSuperColumn>(_list43.size);
+                for (int _i44 = 0; _i44 < _list43.size; ++_i44)
                 {
-                  ColumnOrSuperColumn _elem40;
-                  _elem40 = new ColumnOrSuperColumn();
-                  _elem40.read(iprot);
-                  this.success.add(_elem40);
+                  ColumnOrSuperColumn _elem45;
+                  _elem45 = new ColumnOrSuperColumn();
+                  _elem45.read(iprot);
+                  this.success.add(_elem45);
                 }
                 iprot.readListEnd();
               }
@@ -7195,9 +7195,9 @@ public class Cassandra {
         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
         {
           oprot.writeListBegin(new TList(TType.STRUCT, this.success.size()));
-          for (ColumnOrSuperColumn _iter41 : this.success)
+          for (ColumnOrSuperColumn _iter46 : this.success)
           {
-            _iter41.write(oprot);
+            _iter46.write(oprot);
           }
           oprot.writeListEnd();
         }
@@ -8949,13 +8949,13 @@ public class Cassandra {
           case 1: // KEYS
             if (field.type == TType.LIST) {
               {
-                TList _list42 = iprot.readListBegin();
-                this.keys = new ArrayList<ByteBuffer>(_list42.size);
-                for (int _i43 = 0; _i43 < _list42.size; ++_i43)
+                TList _list47 = iprot.readListBegin();
+                this.keys = new ArrayList<ByteBuffer>(_list47.size);
+                for (int _i48 = 0; _i48 < _list47.size; ++_i48)
                 {
-                  ByteBuffer _elem44;
-                  _elem44 = iprot.readBinary();
-                  this.keys.add(_elem44);
+                  ByteBuffer _elem49;
+                  _elem49 = iprot.readBinary();
+                  this.keys.add(_elem49);
                 }
                 iprot.readListEnd();
               }
@@ -9005,9 +9005,9 @@ public class Cassandra {
         oprot.writeFieldBegin(KEYS_FIELD_DESC);
         {
           oprot.writeListBegin(new TList(TType.STRING, this.keys.size()));
-          for (ByteBuffer _iter45 : this.keys)
+          for (ByteBuffer _iter50 : this.keys)
           {
-            oprot.writeBinary(_iter45);
+            oprot.writeBinary(_iter50);
           }
           oprot.writeListEnd();
         }
@@ -9580,26 +9580,26 @@ public class Cassandra {
           case 0: // SUCCESS
             if (field.type == TType.MAP) {
               {
-                TMap _map46 = iprot.readMapBegin();
-                this.success = new HashMap<ByteBuffer,List<ColumnOrSuperColumn>>(2*_map46.size);
-                for (int _i47 = 0; _i47 < _map46.size; ++_i47)
+                TMap _map51 = iprot.readMapBegin();
+                this.success = new HashMap<ByteBuffer,List<ColumnOrSuperColumn>>(2*_map51.size);
+                for (int _i52 = 0; _i52 < _map51.size; ++_i52)
                 {
-                  ByteBuffer _key48;
-                  List<ColumnOrSuperColumn> _val49;
-                  _key48 = iprot.readBinary();
+                  ByteBuffer _key53;
+                  List<ColumnOrSuperColumn> _val54;
+                  _key53 = iprot.readBinary();
                   {
-                    TList _list50 = iprot.readListBegin();
-                    _val49 = new ArrayList<ColumnOrSuperColumn>(_list50.size);
-                    for (int _i51 = 0; _i51 < _list50.size; ++_i51)
+                    TList _list55 = iprot.readListBegin();
+                    _val54 = new ArrayList<ColumnOrSuperColumn>(_list55.size);
+                    for (int _i56 = 0; _i56 < _list55.size; ++_i56)
                     {
-                      ColumnOrSuperColumn _elem52;
-                      _elem52 = new ColumnOrSuperColumn();
-                      _elem52.read(iprot);
-                      _val49.add(_elem52);
+                      ColumnOrSuperColumn _elem57;
+                      _elem57 = new ColumnOrSuperColumn();
+                      _elem57.read(iprot);
+                      _val54.add(_elem57);
                     }
                     iprot.readListEnd();
                   }
-                  this.success.put(_key48, _val49);
+                  this.success.put(_key53, _val54);
                 }
                 iprot.readMapEnd();
               }
@@ -9649,14 +9649,14 @@ public class Cassandra {
         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
         {
           oprot.writeMapBegin(new TMap(TType.STRING, TType.LIST, this.success.size()));
-          for (Map.Entry<ByteBuffer, List<ColumnOrSuperColumn>> _iter53 : this.success.entrySet())
+          for (Map.Entry<ByteBuffer, List<ColumnOrSuperColumn>> _iter58 : this.success.entrySet())
           {
-            oprot.writeBinary(_iter53.getKey());
+            oprot.writeBinary(_iter58.getKey());
             {
-              oprot.writeListBegin(new TList(TType.STRUCT, _iter53.getValue().size()));
-              for (ColumnOrSuperColumn _iter54 : _iter53.getValue())
+              oprot.writeListBegin(new TList(TType.STRUCT, _iter58.getValue().size()));
+              for (ColumnOrSuperColumn _iter59 : _iter58.getValue())
               {
-                _iter54.write(oprot);
+                _iter59.write(oprot);
               }
               oprot.writeListEnd();
             }
@@ -10228,13 +10228,13 @@ public class Cassandra {
           case 1: // KEYS
             if (field.type == TType.LIST) {
               {
-                TList _list55 = iprot.readListBegin();
-                this.keys = new ArrayList<ByteBuffer>(_list55.size);
-                for (int _i56 = 0; _i56 < _list55.size; ++_i56)
+                TList _list60 = iprot.readListBegin();
+                this.keys = new ArrayList<ByteBuffer>(_list60.size);
+                for (int _i61 = 0; _i61 < _list60.size; ++_i61)
                 {
-                  ByteBuffer _elem57;
-                  _elem57 = iprot.readBinary();
-                  this.keys.add(_elem57);
+                  ByteBuffer _elem62;
+                  _elem62 = iprot.readBinary();
+                  this.keys.add(_elem62);
                 }
                 iprot.readListEnd();
               }
@@ -10284,9 +10284,9 @@ public class Cassandra {
         oprot.writeFieldBegin(KEYS_FIELD_DESC);
         {
           oprot.writeListBegin(new TList(TType.STRING, this.keys.size()));
-          for (ByteBuffer _iter58 : this.keys)
+          for (ByteBuffer _iter63 : this.keys)
           {
-            oprot.writeBinary(_iter58);
+            oprot.writeBinary(_iter63);
           }
           oprot.writeListEnd();
         }
@@ -10855,15 +10855,15 @@ public class Cassandra {
           case 0: // SUCCESS
             if (field.type == TType.MAP) {
               {
-                TMap _map59 = iprot.readMapBegin();
-                this.success = new HashMap<ByteBuffer,Integer>(2*_map59.size);
-                for (int _i60 = 0; _i60 < _map59.size; ++_i60)
+                TMap _map64 = iprot.readMapBegin();
+                this.success = new HashMap<ByteBuffer,Integer>(2*_map64.size);
+                for (int _i65 = 0; _i65 < _map64.size; ++_i65)
                 {
-                  ByteBuffer _key61;
-                  int _val62;
-                  _key61 = iprot.readBinary();
-                  _val62 = iprot.readI32();
-                  this.success.put(_key61, _val62);
+                  ByteBuffer _key66;
+                  int _val67;
+                  _key66 = iprot.readBinary();
+                  _val67 = iprot.readI32();
+                  this.success.put(_key66, _val67);
                 }
                 iprot.readMapEnd();
               }
@@ -10913,10 +10913,10 @@ public class Cassandra {
         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
         {
           oprot.writeMapBegin(new TMap(TType.STRING, TType.I32, this.success.size()));
-          for (Map.Entry<ByteBuffer, Integer> _iter63 : this.success.entrySet())
+          for (Map.Entry<ByteBuffer, Integer> _iter68 : this.success.entrySet())
           {
-            oprot.writeBinary(_iter63.getKey());
-            oprot.writeI32(_iter63.getValue());
+            oprot.writeBinary(_iter68.getKey());
+            oprot.writeI32(_iter68.getValue());
           }
           oprot.writeMapEnd();
         }
@@ -12068,14 +12068,14 @@ public class Cassandra {
           case 0: // SUCCESS
             if (field.type == TType.LIST) {
               {
-                TList _list64 = iprot.readListBegin();
-                this.success = new ArrayList<KeySlice>(_list64.size);
-                for (int _i65 = 0; _i65 < _list64.size; ++_i65)
+                TList _list69 = iprot.readListBegin();
+                this.success = new ArrayList<KeySlice>(_list69.size);
+                for (int _i70 = 0; _i70 < _list69.size; ++_i70)
                 {
-                  KeySlice _elem66;
-                  _elem66 = new KeySlice();
-                  _elem66.read(iprot);
-                  this.success.add(_elem66);
+                  KeySlice _elem71;
+                  _elem71 = new KeySlice();
+                  _elem71.read(iprot);
+                  this.success.add(_elem71);
                 }
                 iprot.readListEnd();
               }
@@ -12125,9 +12125,9 @@ public class Cassandra {
         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
         {
           oprot.writeListBegin(new TList(TType.STRUCT, this.success.size()));
-          for (KeySlice _iter67 : this.success)
+          for (KeySlice _iter72 : this.success)
           {
-            _iter67.write(oprot);
+            _iter72.write(oprot);
           }
           oprot.writeListEnd();
         }
@@ -13279,14 +13279,14 @@ public class Cassandra {
           case 0: // SUCCESS
             if (field.type == TType.LIST) {
               {
-                TList _list68 = iprot.readListBegin();
-                this.success = new ArrayList<KeySlice>(_list68.size);
-                for (int _i69 = 0; _i69 < _list68.size; ++_i69)
+                TList _list73 = iprot.readListBegin();
+                this.success = new ArrayList<KeySlice>(_list73.size);
+                for (int _i74 = 0; _i74 < _list73.size; ++_i74)
                 {
-                  KeySlice _elem70;
-                  _elem70 = new KeySlice();
-                  _elem70.read(iprot);
-                  this.success.add(_elem70);
+                  KeySlice _elem75;
+                  _elem75 = new KeySlice();
+                  _elem75.read(iprot);
+                  this.success.add(_elem75);
                 }
                 iprot.readListEnd();
               }
@@ -13336,9 +13336,9 @@ public class Cassandra {
         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
         {
           oprot.writeListBegin(new TList(TType.STRUCT, this.success.size()));
-          for (KeySlice _iter71 : this.success)
+          for (KeySlice _iter76 : this.success)
           {
-            _iter71.write(oprot);
+            _iter76.write(oprot);
           }
           oprot.writeListEnd();
         }
@@ -15955,38 +15955,38 @@ public class Cassandra {
           case 1: // MUTATION_MAP
             if (field.type == TType.MAP) {
               {
-                TMap _map72 = iprot.readMapBegin();
-                this.mutation_map = new HashMap<ByteBuffer,Map<String,List<Mutation>>>(2*_map72.size);
-                for (int _i73 = 0; _i73 < _map72.size; ++_i73)
+                TMap _map77 = iprot.readMapBegin();
+                this.mutation_map = new HashMap<ByteBuffer,Map<String,List<Mutation>>>(2*_map77.size);
+                for (int _i78 = 0; _i78 < _map77.size; ++_i78)
                 {
-                  ByteBuffer _key74;
-                  Map<String,List<Mutation>> _val75;
-                  _key74 = iprot.readBinary();
+                  ByteBuffer _key79;
+                  Map<String,List<Mutation>> _val80;
+                  _key79 = iprot.readBinary();
                   {
-                    TMap _map76 = iprot.readMapBegin();
-                    _val75 = new HashMap<String,List<Mutation>>(2*_map76.size);
-                    for (int _i77 = 0; _i77 < _map76.size; ++_i77)
+                    TMap _map81 = iprot.readMapBegin();
+                    _val80 = new HashMap<String,List<Mutation>>(2*_map81.size);
+                    for (int _i82 = 0; _i82 < _map81.size; ++_i82)
                     {
-                      String _key78;
-                      List<Mutation> _val79;
-                      _key78 = iprot.readString();
+                      String _key83;
+                      List<Mutation> _val84;
+                      _key83 = iprot.readString();
                       {
-                        TList _list80 = iprot.readListBegin();
-                        _val79 = new ArrayList<Mutation>(_list80.size);
-                        for (int _i81 = 0; _i81 < _list80.size; ++_i81)
+                        TList _list85 = iprot.readListBegin();
+                        _val84 = new ArrayList<Mutation>(_list85.size);
+                        for (int _i86 = 0; _i86 < _list85.size; ++_i86)
                         {
-                          Mutation _elem82;
-                          _elem82 = new Mutation();
-                          _elem82.read(iprot);
-                          _val79.add(_elem82);
+                          Mutation _elem87;
+                          _elem87 = new Mutation();
+                          _elem87.read(iprot);
+                          _val84.add(_elem87);
                         }
                         iprot.readListEnd();
                       }
-                      _val75.put(_key78, _val79);
+                      _val80.put(_key83, _val84);
                     }
                     iprot.readMapEnd();
                   }
-                  this.mutation_map.put(_key74, _val75);
+                  this.mutation_map.put(_key79, _val80);
                 }
                 iprot.readMapEnd();
               }
@@ -16020,19 +16020,19 @@ public class Cassandra {
         oprot.writeFieldBegin(MUTATION_MAP_FIELD_DESC);
         {
           oprot.writeMapBegin(new TMap(TType.STRING, TType.MAP, this.mutation_map.size()));
-          for (Map.Entry<ByteBuffer, Map<String,List<Mutation>>> _iter83 : this.mutation_map.entrySet())
+          for (Map.Entry<ByteBuffer, Map<String,List<Mutation>>> _iter88 : this.mutation_map.entrySet())
           {
-            oprot.writeBinary(_iter83.getKey());
+            oprot.writeBinary(_iter88.getKey());
             {
-              oprot.writeMapBegin(new TMap(TType.STRING, TType.LIST, _iter83.getValue().size()));
-              for (Map.Entry<String, List<Mutation>> _iter84 : _iter83.getValue().entrySet())
+              oprot.writeMapBegin(new TMap(TType.STRING, TType.LIST, _iter88.getValue().size()));
+              for (Map.Entry<String, List<Mutation>> _iter89 : _iter88.getValue().entrySet())
               {
-                oprot.writeString(_iter84.getKey());
+                oprot.writeString(_iter89.getKey());
                 {
-                  oprot.writeListBegin(new TList(TType.STRUCT, _iter84.getValue().size()));
-                  for (Mutation _iter85 : _iter84.getValue())
+                  oprot.writeListBegin(new TList(TType.STRUCT, _iter89.getValue().size()));
+                  for (Mutation _iter90 : _iter89.getValue())
                   {
-                    _iter85.write(oprot);
+                    _iter90.write(oprot);
                   }
                   oprot.writeListEnd();
                 }
@@ -17767,25 +17767,25 @@ public class Cassandra {
           case 0: // SUCCESS
             if (field.type == TType.MAP) {
               {
-                TMap _map86 = iprot.readMapBegin();
-                this.success = new HashMap<String,List<String>>(2*_map86.size);
-                for (int _i87 = 0; _i87 < _map86.size; ++_i87)
+                TMap _map91 = iprot.readMapBegin();
+                this.success = new HashMap<String,List<String>>(2*_map91.size);
+                for (int _i92 = 0; _i92 < _map91.size; ++_i92)
                 {
-                  String _key88;
-                  List<String> _val89;
-                  _key88 = iprot.readString();
+                  String _key93;
+                  List<String> _val94;
+                  _key93 = iprot.readString();
                   {
-                    TList _list90 = iprot.readListBegin();
-                    _val89 = new ArrayList<String>(_list90.size);
-                    for (int _i91 = 0; _i91 < _list90.size; ++_i91)
+                    TList _list95 = iprot.readListBegin();
+                    _val94 = new ArrayList<String>(_list95.size);
+                    for (int _i96 = 0; _i96 < _list95.size; ++_i96)
                     {
-                      String _elem92;
-                      _elem92 = iprot.readString();
-                      _val89.add(_elem92);
+                      String _elem97;
+                      _elem97 = iprot.readString();
+                      _val94.add(_elem97);
                     }
                     iprot.readListEnd();
                   }
-                  this.success.put(_key88, _val89);
+                  this.success.put(_key93, _val94);
                 }
                 iprot.readMapEnd();
               }
@@ -17819,14 +17819,14 @@ public class Cassandra {
         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
         {
           oprot.writeMapBegin(new TMap(TType.STRING, TType.LIST, this.success.size()));
-          for (Map.Entry<String, List<String>> _iter93 : this.success.entrySet())
+          for (Map.Entry<String, List<String>> _iter98 : this.success.entrySet())
           {
-            oprot.writeString(_iter93.getKey());
+            oprot.writeString(_iter98.getKey());
             {
-              oprot.writeListBegin(new TList(TType.STRING, _iter93.getValue().size()));
-              for (String _iter94 : _iter93.getValue())
+              oprot.writeListBegin(new TList(TType.STRING, _iter98.getValue().size()));
+              for (String _iter99 : _iter98.getValue())
               {
-                oprot.writeString(_iter94);
+                oprot.writeString(_iter99);
               }
               oprot.writeListEnd();
             }
@@ -18393,14 +18393,14 @@ public class Cassandra {
           case 0: // SUCCESS
             if (field.type == TType.LIST) {
               {
-                TList _list95 = iprot.readListBegin();
-                this.success = new ArrayList<KsDef>(_list95.size);
-                for (int _i96 = 0; _i96 < _list95.size; ++_i96)
+                TList _list100 = iprot.readListBegin();
+                this.success = new ArrayList<KsDef>(_list100.size);
+                for (int _i101 = 0; _i101 < _list100.size; ++_i101)
                 {
-                  KsDef _elem97;
-                  _elem97 = new KsDef();
-                  _elem97.read(iprot);
-                  this.success.add(_elem97);
+                  KsDef _elem102;
+                  _elem102 = new KsDef();
+                  _elem102.read(iprot);
+                  this.success.add(_elem102);
                 }
                 iprot.readListEnd();
               }
@@ -18434,9 +18434,9 @@ public class Cassandra {
         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
         {
           oprot.writeListBegin(new TList(TType.STRUCT, this.success.size()));
-          for (KsDef _iter98 : this.success)
+          for (KsDef _iter103 : this.success)
           {
-            _iter98.write(oprot);
+            _iter103.write(oprot);
           }
           oprot.writeListEnd();
         }
@@ -20053,14 +20053,14 @@ public class Cassandra {
           case 0: // SUCCESS
             if (field.type == TType.LIST) {
               {
-                TList _list99 = iprot.readListBegin();
-                this.success = new ArrayList<TokenRange>(_list99.size);
-                for (int _i100 = 0; _i100 < _list99.size; ++_i100)
+                TList _list104 = iprot.readListBegin();
+                this.success = new ArrayList<TokenRange>(_list104.size);
+                for (int _i105 = 0; _i105 < _list104.size; ++_i105)
                 {
-                  TokenRange _elem101;
-                  _elem101 = new TokenRange();
-                  _elem101.read(iprot);
-                  this.success.add(_elem101);
+                  TokenRange _elem106;
+                  _elem106 = new TokenRange();
+                  _elem106.read(iprot);
+                  this.success.add(_elem106);
                 }
                 iprot.readListEnd();
               }
@@ -20094,9 +20094,9 @@ public class Cassandra {
         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
         {
           oprot.writeListBegin(new TList(TType.STRUCT, this.success.size()));
-          for (TokenRange _iter102 : this.success)
+          for (TokenRange _iter107 : this.success)
           {
-            _iter102.write(oprot);
+            _iter107.write(oprot);
           }
           oprot.writeListEnd();
         }
@@ -22696,13 +22696,13 @@ public class Cassandra {
           case 0: // SUCCESS
             if (field.type == TType.LIST) {
               {
-                TList _list103 = iprot.readListBegin();
-                this.success = new ArrayList<String>(_list103.size);
-                for (int _i104 = 0; _i104 < _list103.size; ++_i104)
+                TList _list108 = iprot.readListBegin();
+                this.success = new ArrayList<String>(_list108.size);
+                for (int _i109 = 0; _i109 < _list108.size; ++_i109)
                 {
-                  String _elem105;
-                  _elem105 = iprot.readString();
-                  this.success.add(_elem105);
+                  String _elem110;
+                  _elem110 = iprot.readString();
+                  this.success.add(_elem110);
                 }
                 iprot.readListEnd();
               }
@@ -22728,9 +22728,9 @@ public class Cassandra {
         oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
         {
           oprot.writeListBegin(new TList(TType.STRING, this.success.size()));
-          for (String _iter106 : this.success)
+          for (String _iter111 : this.success)
           {
-            oprot.writeString(_iter106);
+            oprot.writeString(_iter111);
           }
           oprot.writeListEnd();
         }
